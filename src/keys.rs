@@ -93,9 +93,8 @@ impl<'de> Deserialize<'de> for TransportPublicKey {
 /// Serializes as a lowercase hex string in human-readable formats (TOML, JSON)
 /// and as raw 32 bytes in binary formats (postcard). Serialization is gated
 /// behind `ExposeSecret` — only call it when writing config files.
-///
-/// Clone is intentionally not derived — key material should not be casually
-/// copied. Load once from config and pass by reference.
+/// 
+#[derive(Clone)]
 pub struct TransportPrivateKey(Secret<[u8; 32]>);
 
 impl TransportPrivateKey {

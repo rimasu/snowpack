@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use secrecy::{ExposeSecret, SecretVec};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -80,11 +80,12 @@ impl AuthHeader {
     pub fn sign(&self, signing_key: &SignatureSigningKey) -> Result<SignedAuthHeader, SigningErr> {
         signing_key
             .sign(self)
-            .map(|raw| SignedAuthHeader(SecretVec::new(raw)))
+            .map(|raw| SignedAuthHeader(Arc::new(SecretVec::new(raw))))
     }
 }
 
-pub struct SignedAuthHeader(SecretVec<u8>);
+#[derive(Clone)]
+pub struct SignedAuthHeader(Arc<SecretVec<u8>>);
 
 impl SignedAuthHeader {
     pub fn verify(&self, key: &SignatureVerificationKey) -> Result<AuthHeader, BadAuth> {
@@ -115,7 +116,7 @@ impl TryFrom<&str> for SignedAuthHeader {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         hex::decode(value)
-            .map(|a| SignedAuthHeader(SecretVec::new(a)))
+            .map(|a| SignedAuthHeader(Arc::new(SecretVec::new(a))))
             .map_err(|_| MalformedAuthHeader)
     }
 }
@@ -141,10 +142,10 @@ impl<'de> Deserialize<'de> for SignedAuthHeader {
         if d.is_human_readable() {
             let s = String::deserialize(d)?;
             let bytes = hex::decode(&s).map_err(de::Error::custom)?;
-            Ok(Self(SecretVec::new(bytes)))
+            Ok(Self(Arc::new(SecretVec::new(bytes))))
         } else {
             let bytes = Vec::<u8>::deserialize(d)?;
-            Ok(Self(SecretVec::new(bytes)))
+            Ok(Self(Arc::new(SecretVec::new(bytes))))
         }
     }
 }

@@ -31,14 +31,12 @@ impl NodeId {
     }
 }
 
-#[cfg(test)]
 impl From<u64> for NodeId {
     fn from(value: u64) -> Self {
         NodeId(value.to_be_bytes().to_vec())
     }
 }
 
-#[cfg(test)]
 impl From<u32> for NodeId {
     fn from(value: u32) -> Self {
         NodeId(value.to_be_bytes().to_vec())
