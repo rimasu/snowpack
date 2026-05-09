@@ -24,7 +24,7 @@ pub enum PacketBuildError {
 ///   1. Call prepare to start a new message and set the message type.
 ///   2. Call pack one or more times, passing last = true on the final chunk.
 ///   3. The returned slice is valid until the next call to pack or prepare.
-pub struct PacketBuilder {
+pub(crate) struct PacketBuilder {
     in_progress: bool,
     header: u8,
     buf: Vec<u8>,
@@ -32,7 +32,7 @@ pub struct PacketBuilder {
 
 impl PacketBuilder {
     /// Create a new PacketBuilder.
-    pub fn new() -> PacketBuilder {
+    pub(crate) fn new() -> PacketBuilder {
         PacketBuilder {
             in_progress: false,
             header: 0,
@@ -45,7 +45,7 @@ impl PacketBuilder {
     /// msg_type is masked to the lower six bits. Returns
     /// MessageAlreadyInProgress if pack has not yet been called with
     /// last = true for the previous message.
-    pub fn prepare(&mut self, msg_type: u8) -> Result<(), PacketBuildError> {
+    pub(crate) fn prepare(&mut self, msg_type: u8) -> Result<(), PacketBuildError> {
         if self.in_progress {
             Err(PacketBuildError::MessageAlreadyInProgress)
         } else {
@@ -64,7 +64,7 @@ impl PacketBuilder {
     /// flag in the header and allows prepare to be called again afterwards.
     ///
     /// Returns NoMessageInProgress if prepare has not been called.
-    pub fn pack(&mut self, payload: &[u8], last: bool) -> Result<&[u8], PacketBuildError> {
+    pub(crate) fn pack(&mut self, payload: &[u8], last: bool) -> Result<&[u8], PacketBuildError> {
         if !self.in_progress {
             return Err(PacketBuildError::NoMessageInProgress);
         }
@@ -111,24 +111,24 @@ pub enum PacketReadError {
     MissingFirst { msg_type: u8 },
 }
 
-pub const MAX_CIPHERTEXT_SIZE: usize = 0xFFFF;
-pub const CIPHER_OVERHEAD_SIZE: usize = 16;
-pub const MAX_RAW_PACKET_SIZE: usize = MAX_CIPHERTEXT_SIZE - CIPHER_OVERHEAD_SIZE;
-pub const MAX_PACKET_SIZE: usize = MAX_RAW_PACKET_SIZE - 1;
+pub(crate) const MAX_CIPHERTEXT_SIZE: usize = 0xFFFF;
+pub(crate) const CIPHER_OVERHEAD_SIZE: usize = 16;
+pub(crate) const MAX_RAW_PACKET_SIZE: usize = MAX_CIPHERTEXT_SIZE - CIPHER_OVERHEAD_SIZE;
+pub(crate) const MAX_PACKET_SIZE: usize = MAX_RAW_PACKET_SIZE - 1;
 
 /// Reads and validates framed packets arriving from a noise/snow encrypted transport.
 ///
 /// Maintains state across successive calls to read so that multi-packet messages
 /// can be validated for consistency. A Packet returned by read borrows directly
 /// from the raw_packet slice passed in, so no copying of the payload occurs.
-pub struct PacketReader {
+pub(crate) struct PacketReader {
     in_progress: bool,
     msg_type: u8,
 }
 
 impl PacketReader {
     /// Create a new PacketReader.
-    pub fn new() -> PacketReader {
+    pub(crate) fn new() -> PacketReader {
         PacketReader {
             in_progress: false,
             msg_type: 0,
@@ -147,7 +147,7 @@ impl PacketReader {
     ///   MissingFirst          - continuation or last packet with no message in progress
     ///   MessageTypeChange     - message type differs from the one started by the first packet
     ///   UnexpectedLast        - last-packet flag set with no message in progress
-    pub fn read(&mut self, raw_packet: &[u8]) -> Result<Packet, PacketReadError> {
+    pub(crate) fn read(&mut self, raw_packet: &[u8]) -> Result<PacketHeader, PacketReadError> {
         if raw_packet.is_empty() {
             return Err(PacketReadError::RawPacketEmpty);
         }
@@ -185,31 +185,20 @@ impl PacketReader {
             }
         }
 
-        Ok(Packet {
-            first,
-            last,
-            msg_type,
-            from: 1,
-            to: raw_packet.len(),
-        })
+        Ok(PacketHeader { first, last, msg_type })
     }
 }
 
-/// A successfully parsed packet.
+/// The decoded header of a successfully parsed packet.
 ///
-/// Borrows its payload directly from the raw packet slice passed to
-/// PacketReader::read. The reader has already verified that this packet
-/// is consistent with the current message in progress.
-pub struct Packet {
-    /// True if this is the first packet of a message.
-    pub first: bool,
-    /// True if this is the last packet of a message.
-    pub last: bool,
-    /// The message type, in the range 0..=63.
-    pub msg_type: u8,
-    /// The range of the plaintext buffer that contains the data.
-    pub(crate) from: usize,
-    pub(crate) to: usize,
+/// The reader has already verified that this packet is consistent with the
+/// current message in progress. The payload is not included here — callers
+/// retrieve it from the buffer they passed to `PacketReader::read`.
+pub(crate) struct PacketHeader {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) first: bool,
+    pub(crate) last: bool,
+    pub(crate) msg_type: u8,
 }
 
 #[cfg(test)]
@@ -301,8 +290,6 @@ mod tests {
         assert!(pkt.first);
         assert!(pkt.last);
         assert_eq!(pkt.msg_type, 3);
-        assert_eq!(pkt.from, 1);
-        assert_eq!(pkt.to, 3);
     }
 
     #[test]
@@ -387,8 +374,7 @@ mod tests {
         let h = FIRST_PACKET_MASK | LAST_PACKET_MASK;
         let buf = [h];
         let pkt = r.read(&buf).unwrap();
-        assert_eq!(pkt.from, 1);
-        assert_eq!(pkt.to, 1);
+        assert!(pkt.first && pkt.last);
     }
 
     // -------------------------------------------------------------------------
@@ -407,7 +393,7 @@ mod tests {
         assert!(pkt.first);
         assert!(pkt.last);
         assert_eq!(pkt.msg_type, 10);
-        assert_eq!(&raw[pkt.from..pkt.to], b"roundtrip");
+        assert_eq!(&raw[1..], b"roundtrip");
     }
 
     #[test]
@@ -421,12 +407,10 @@ mod tests {
 
         let pkt1 = r.read(&p1).unwrap();
         assert!(pkt1.first && !pkt1.last);
-        assert_eq!(pkt1.from, 1);
-        assert_eq!(pkt1.to, 4);
+        assert_eq!(&p1[1..], b"foo");
 
         let pkt2 = r.read(&p2).unwrap();
         assert!(!pkt2.first && pkt2.last);
-        assert_eq!(pkt2.from, 1);
-        assert_eq!(pkt2.to, 4);
+        assert_eq!(&p2[1..], b"bar");
     }
 }

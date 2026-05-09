@@ -1,32 +1,35 @@
 use std::io;
-use snow::TransportState;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
+use tokio::io::ReadHalf;
+use tokio::io::WriteHalf;
+use tokio::io::split;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
 
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 use crate::NodeId;
 use crate::auth::BadAuth;
 use crate::auth::SignedAuthHeader;
-use crate::keys::TransportPrivateKey;
-use crate::keys::TransportPublicKey;
+use crate::noise::TransportPrivateKey;
+use crate::noise::TransportPublicKey;
 use crate::noise::noise_params;
-use crate::packet::MAX_CIPHERTEXT_SIZE;
-use crate::packet::MAX_PACKET_SIZE;
-use crate::packet::Packet;
-use crate::packet::PacketBuildError;
-use crate::packet::PacketBuilder;
-use crate::packet::PacketReadError;
-use crate::packet::PacketReader;
+use crate::packet_state::MAX_CIPHERTEXT_SIZE;
+use crate::packet_state::MAX_PACKET_SIZE;
+use crate::packet_state::PacketBuildError;
+use crate::packet_state::PacketBuilder;
+use crate::packet_state::PacketHeader;
+use crate::packet_state::PacketReadError;
+use crate::packet_state::PacketReader;
 use crate::sign::SignatureVerificationKey;
 
-
-
-
-
-/// All errors that can occur during transport operations.
+/// All errors that can occur during connection operations.
 #[derive(Debug, thiserror::Error)]
-pub enum TransportError {
+pub enum ConnectionError {
     /// An underlying I/O error from the stream.
     #[error("io: {0}")]
     Io(#[from] io::Error),
@@ -54,8 +57,8 @@ pub enum TransportError {
     #[error("remote static key has wrong length")]
     RemoteStaticKeyLength,
 
-    #[error("invalid message type: {0}")]
-    InvalidMessageType(u8),
+    #[error("handshake timed out")]
+    HandshakeTimeout,
 
     #[error("invalid node id: {0}")]
     InvalidNodeId(String),
@@ -67,7 +70,6 @@ pub enum TransportError {
     BadAuth(#[from] BadAuth),
 }
 
-
 // ---------------------------------------------------------------------------
 // Framing helpers (private)
 //
@@ -75,7 +77,7 @@ pub enum TransportError {
 // that many bytes of payload. Used for both handshake and transport messages.
 // ---------------------------------------------------------------------------
 
-async fn read_frame<S>(stream: &mut S, frame: &mut Vec<u8>) -> Result<(), TransportError>
+async fn read_frame<S>(stream: &mut S, frame: &mut Vec<u8>) -> Result<(), ConnectionError>
 where
     S: AsyncRead + Unpin,
 {
@@ -85,25 +87,25 @@ where
     Ok(())
 }
 
-async fn write_frame<S>(stream: &mut S, data: &[u8]) -> Result<(), TransportError>
+async fn write_frame<S>(stream: &mut S, data: &[u8]) -> Result<(), ConnectionError>
 where
     S: AsyncWrite + Unpin,
 {
     let len: u16 = data
         .len()
         .try_into()
-        .map_err(|_| TransportError::PacketOverflow)?;
+        .map_err(|_| ConnectionError::PacketOverflow)?;
     stream.write_u16(len).await?;
     stream.write_all(data).await?;
-    stream.flush().await.map_err(TransportError::from)
+    stream.flush().await.map_err(ConnectionError::from)
 }
 
 // ---------------------------------------------------------------------------
 // HandshakeContext
 //
 // Owns the stream, the snow HandshakeState, and its associated buffers for
-// the duration of the XX handshake. Consumed by `into_transport` once
-// complete, which returns a fully constructed PacketTransport.
+// the duration of the XX handshake. Consumed by `into_split` once complete,
+// which splits the stream and returns the ready PacketTx/PacketRx pair.
 // ---------------------------------------------------------------------------
 
 struct HandshakeContext<S> {
@@ -117,7 +119,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HandshakeContext<S> {
     fn new_initiator(
         stream: S,
         local_private: &TransportPrivateKey,
-    ) -> Result<Self, TransportError> {
+    ) -> Result<Self, ConnectionError> {
         let handshake = snow::Builder::new(noise_params())
             .local_private_key(local_private.expose())
             .build_initiator()?;
@@ -132,7 +134,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HandshakeContext<S> {
     fn new_responder(
         stream: S,
         local_private: &TransportPrivateKey,
-    ) -> Result<Self, TransportError> {
+    ) -> Result<Self, ConnectionError> {
         let handshake = snow::Builder::new(noise_params())
             .local_private_key(local_private.expose())
             .build_responder()?;
@@ -146,89 +148,73 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HandshakeContext<S> {
 
     /// Read one handshake frame and return a view of the decrypted payload.
     /// The slice is valid until the next call to `recv`.
-    async fn recv(&mut self) -> Result<&[u8], TransportError> {
+    async fn recv(&mut self) -> Result<&[u8], ConnectionError> {
         read_frame(&mut self.stream, &mut self.frame).await?;
-
         let n = self
             .handshake
             .read_message(&self.frame, &mut self.noise_buf)?;
-
         Ok(&self.noise_buf[..n])
     }
 
     /// Encrypt `payload` and write one handshake frame.
-    async fn send(&mut self, payload: &[u8]) -> Result<(), TransportError> {
+    async fn send(&mut self, payload: &[u8]) -> Result<(), ConnectionError> {
         let n = self.handshake.write_message(payload, &mut self.noise_buf)?;
         write_frame(&mut self.stream, &self.noise_buf[..n]).await
     }
 
-    fn remote_static(&self) -> Result<TransportPublicKey, TransportError> {
+    fn remote_static(&self) -> Result<TransportPublicKey, ConnectionError> {
         let raw = self
             .handshake
             .get_remote_static()
-            .ok_or(TransportError::MissingRemoteStatic)?;
-
+            .ok_or(ConnectionError::MissingRemoteStatic)?;
         let arr: [u8; 32] = raw
             .try_into()
-            .map_err(|_| TransportError::RemoteStaticKeyLength)?;
-
+            .map_err(|_| ConnectionError::RemoteStaticKeyLength)?;
         Ok(TransportPublicKey::from(arr))
     }
 
-    fn into_transport(self) -> Result<PacketTransport<S>, TransportError> {
-        let state = self.handshake.into_transport_mode()?;
-        Ok(PacketTransport::new(self.stream, state))
+    fn into_split(self) -> Result<(PacketTx<WriteHalf<S>>, PacketRx<ReadHalf<S>>), ConnectionError> {
+        let state = Arc::new(Mutex::new(self.handshake.into_transport_mode()?));
+        let (read, write) = split(self.stream);
+
+        let tx = PacketTx {
+            state: state.clone(),
+            packet_builder: PacketBuilder::new(),
+            write,
+            write_buf: Vec::new(),
+        };
+        let rx = PacketRx {
+            state,
+            packet_reader: PacketReader::new(),
+            read,
+            ciphertext_buf: self.frame,
+            plaintext_buf: self.noise_buf,
+            payload_end: 0,
+        };
+        Ok((tx, rx))
     }
 }
 
-// ===========================================================================
-// PacketTransport
-//
-// Owns the stream and its buffers. Intended to be long-lived — buffers are
-// allocated once during the handshake and reused across RPCs.
-// ===========================================================================
+// ---------------------------------------------------------------------------
+// Handshake entry points
+// ---------------------------------------------------------------------------
 
-/// Created by completing a Noise XX handshake via [`PacketTransport::accept`]
-/// or [`PacketTransport::connect`]. Owns the underlying stream and reuses
-/// internal buffers across reads to avoid per-RPC allocation.
-pub struct PacketTransport<S> {
-    state: snow::TransportState,
-    packet_reader: PacketReader,
-    packet_builder: PacketBuilder,
+/// Complete a Noise XX handshake as the **responder** (server side).
+///
+/// Verifies the initiator's signed auth header with `verification_key` and
+/// confirms that the Noise static key matches the one in the header.
+///
+/// Returns the split transport pair and the authenticated remote [`NodeId`].
+pub(crate) async fn accept<S>(
     stream: S,
-
-    /// Receives raw ciphertext frames off the wire; resized as needed.
-    ciphertext_buf: Vec<u8>,
-
-    /// Receives decrypted plaintext (header byte + payload); resized as needed.
-    plaintext_buf: Vec<u8>,
-
-    /// Scratch buffer for outbound ciphertext; grown as needed, never shrunk.
-    write_buf: Vec<u8>,
-}
-
-const EMPTY_PAYLOAD: &[u8] = &[];
-
-impl<S> PacketTransport<S>
+    local_private: &TransportPrivateKey,
+    local_auth_header: &SignedAuthHeader,
+    verification_key: &SignatureVerificationKey,
+) -> Result<((PacketTx<WriteHalf<S>>, PacketRx<ReadHalf<S>>), NodeId), ConnectionError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // -----------------------------------------------------------------------
-    // Handshake constructors
-    // -----------------------------------------------------------------------
-
-    /// Complete a Noise XX handshake as the **responder** (server side).
-    ///
-    /// Verifies the initiator's signed auth header with `verification_key` and
-    /// confirms that the Noise static key matches the one in the header.
-    ///
-    /// Returns the transport and the authenticated remote [`NodeId`].
-    pub async fn accept(
-        stream: S,
-        local_private: &TransportPrivateKey,
-        local_auth_header: &SignedAuthHeader,
-        verification_key: &SignatureVerificationKey,
-    ) -> Result<(Self, NodeId), TransportError> {
+    timeout(HANDSHAKE_TIMEOUT, async {
         let mut hs = HandshakeContext::new_responder(stream, local_private)?;
 
         // XX msg 1: → e
@@ -243,22 +229,32 @@ where
 
         remote_auth_header.validate_public_key(&hs.remote_static()?)?;
 
-        let node_id = remote_auth_header.node_id();
-        Ok((hs.into_transport()?, node_id.clone()))
-    }
+        let node_id = remote_auth_header.node_id().clone();
+        Ok((hs.into_split()?, node_id))
+    })
+    .await
+    .map_err(|_| ConnectionError::HandshakeTimeout)?
+}
 
-    /// Complete a Noise XX handshake as the **initiator** (client side).
-    ///
-    /// Verifies the responder's signed auth header with `verification_key`,
-    /// confirms the static key matches, and asserts that the authenticated
-    /// [`NodeId`] equals `target`.
-    pub async fn connect<N>(
-        stream: S,
-        target: N,
-        local_private: &TransportPrivateKey,
-        local_auth_header: &SignedAuthHeader,
-        verification_key: &SignatureVerificationKey,
-    ) -> Result<Self, TransportError> where N: Into<NodeId> {
+/// Complete a Noise XX handshake as the **initiator** (client side).
+///
+/// Verifies the responder's signed auth header with `verification_key`,
+/// confirms the static key matches, and asserts that the authenticated
+/// [`NodeId`] equals `target`.
+///
+/// Returns the split transport pair.
+pub(crate) async fn connect<S, N>(
+    stream: S,
+    target: N,
+    local_private: &TransportPrivateKey,
+    local_auth_header: &SignedAuthHeader,
+    verification_key: &SignatureVerificationKey,
+) -> Result<(PacketTx<WriteHalf<S>>, PacketRx<ReadHalf<S>>), ConnectionError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    N: Into<NodeId>,
+{
+    timeout(HANDSHAKE_TIMEOUT, async {
         let mut hs = HandshakeContext::new_initiator(stream, local_private)?;
 
         // XX msg 1: → e
@@ -274,58 +270,65 @@ where
         // XX msg 3: → s, se  (carry our signed auth header as payload)
         hs.send(local_auth_header.expose()).await?;
 
-        hs.into_transport()
-    }
+        hs.into_split()
+    })
+    .await
+    .map_err(|_| ConnectionError::HandshakeTimeout)?
+}
 
-    fn new(stream: S, state: TransportState) -> Self {
-        Self {
-            state,
-            packet_reader: PacketReader::new(),
-            packet_builder: PacketBuilder::new(),
-            stream,
-            write_buf: Vec::new(),
-            ciphertext_buf: Vec::new(),
-            plaintext_buf: Vec::new(),
-        }
-    }
+// ---------------------------------------------------------------------------
+// PacketRx / PacketTx
+// ---------------------------------------------------------------------------
 
-    // -----------------------------------------------------------------------
-    // Transport I/O
-    // -----------------------------------------------------------------------
+pub(crate) const EMPTY_PAYLOAD: &[u8] = &[];
 
-    /// Read one framed, decrypted packet. Returns the [`PacketHeader`] and a
-    /// slice of the payload — valid until the next call to `read_packet`.
-    pub async fn read_packet(&mut self) -> Result<Packet, TransportError> {
-        read_frame(&mut self.stream, &mut self.ciphertext_buf).await?;
+pub(crate) struct PacketRx<R: AsyncRead + Unpin> {
+    state: Arc<Mutex<snow::TransportState>>,
+    packet_reader: PacketReader,
+    read: R,
+    ciphertext_buf: Vec<u8>,
+    plaintext_buf: Vec<u8>,
+    payload_end: usize,
+}
+
+impl<R: AsyncRead + Unpin> PacketRx<R> {
+    pub(crate) async fn read_packet(&mut self) -> Result<PacketHeader, ConnectionError> {
+        read_frame(&mut self.read, &mut self.ciphertext_buf).await?;
 
         self.plaintext_buf.resize(self.ciphertext_buf.len(), 0);
 
-        let n = self
-            .state
-            .read_message(&self.ciphertext_buf, &mut self.plaintext_buf)?;
+        let n = {
+            let mut t = self.state.lock().expect("snow cipher state poisoned");
+            t.read_message(&self.ciphertext_buf, &mut self.plaintext_buf)?
+        };
 
-        let packet = self.packet_reader.read(&self.plaintext_buf[..n])?;
-        Ok(packet)
+        self.payload_end = n;
+        let header = self.packet_reader.read(&self.plaintext_buf[..n])?;
+        Ok(header)
     }
 
-    pub fn packet_data(&self, packet: &Packet)-> &[u8] {
-        if packet.to > packet.from {
-            &self.plaintext_buf[packet.from..packet.to]
+    pub(crate) fn payload(&self) -> &[u8] {
+        if self.payload_end > 1 {
+            &self.plaintext_buf[1..self.payload_end]
         } else {
             EMPTY_PAYLOAD
         }
     }
+}
 
-    pub fn prepare_message<T>(&mut self, msg_type: T) -> Result<(), TransportError>
-    where
-        T: Into<u8>,
-    {
+pub(crate) struct PacketTx<W: AsyncWrite + Unpin> {
+    state: Arc<Mutex<snow::TransportState>>,
+    packet_builder: PacketBuilder,
+    write: W,
+    write_buf: Vec<u8>,
+}
+
+impl<W: AsyncWrite + Unpin> PacketTx<W> {
+    pub(crate) fn prepare_message<T: Into<u8>>(&mut self, msg_type: T) -> Result<(), ConnectionError> {
         Ok(self.packet_builder.prepare(msg_type.into())?)
     }
 
-    /// Write one framed, encrypted packet.
-    /// `payload` must not exceed [`MAX_PACKET_LEN`] bytes.
-    pub async fn send_packet(&mut self, payload: &[u8], last: bool) -> Result<(), TransportError> {
+    pub(crate) async fn send_packet(&mut self, payload: &[u8], last: bool) -> Result<(), ConnectionError> {
         let plaintext = self.packet_builder.pack(payload, last)?;
 
         let ciphertext_len = plaintext.len() + 16;
@@ -333,20 +336,21 @@ where
             self.write_buf.resize(ciphertext_len, 0);
         }
 
-        let n = self.state.write_message(plaintext, &mut self.write_buf)?;
-        write_frame(&mut self.stream, &self.write_buf[..n]).await
+        let len = {
+            let mut t = self.state.lock().expect("snow cipher state poisoned");
+            t.write_message(plaintext, &mut self.write_buf)?
+        };
+
+        write_frame(&mut self.write, &self.write_buf[..len]).await
     }
 
-    /// Split `data` across as many packets as needed and send them all.
-    /// `last_slice` is forwarded to the final packet's header.
-    pub async fn send_slice(
+    pub(crate) async fn send_slice(
         &mut self,
         data: &[u8],
         last_slice: bool,
-    ) -> Result<(), TransportError> {
+    ) -> Result<(), ConnectionError> {
         let mut chunks = data.chunks(MAX_PACKET_SIZE).peekable();
 
-        // Empty data: send a single empty, terminal packet.
         if chunks.peek().is_none() {
             return self.send_packet(&[], last_slice).await;
         }
@@ -359,10 +363,7 @@ where
         Ok(())
     }
 
-    pub async fn send_reader<R>(
-        &mut self,
-        mut reader: R,
-    ) -> Result<(), TransportError>
+    pub(crate) async fn send_reader<R>(&mut self, mut reader: R) -> Result<(), ConnectionError>
     where
         R: tokio::io::AsyncRead + Unpin,
     {
@@ -373,7 +374,6 @@ where
         loop {
             let space = MAX_PACKET_SIZE - filled;
 
-            // flush full packet
             if space == 0 {
                 self.send_packet(&buf[..filled], false).await?;
                 filled = 0;
@@ -389,7 +389,6 @@ where
             filled += n;
         }
 
-        // flush remainder
         if filled > 0 {
             self.send_packet(&buf[..filled], true).await?;
         } else if !sent_any {
@@ -398,16 +397,19 @@ where
 
         Ok(())
     }
-
-
 }
 
 #[cfg(test)]
 mod tests {
-    use tokio::io::duplex;
+    use tokio::io::{DuplexStream, ReadHalf, WriteHalf, duplex};
 
     use crate::{
-        NodeId, auth::{AuthHeader, BadAuth, SignedAuthHeader}, keys::TransportKeypair, packet::MAX_PACKET_SIZE, packet_transport::{EMPTY_PAYLOAD, PacketTransport, TransportError}, sign::{SignatureKeypair, SignatureVerificationKey}
+        NodeId,
+        auth::{AuthHeader, BadAuth, SignedAuthHeader},
+        noise::TransportKeypair,
+        packet_state::MAX_PACKET_SIZE,
+        packets::{EMPTY_PAYLOAD, PacketRx, PacketTx, ConnectionError, accept, connect},
+        sign::{SignatureKeypair, SignatureVerificationKey},
     };
 
     struct NodeFixture {
@@ -432,33 +434,23 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Handshake harness
-    //
-    // Both sides are spawned as separate tasks so the tokio runtime can
-    // interleave their reads and writes. Driving them sequentially on one
-    // thread would deadlock at the first blocking recv.
-    //
-    // The duplex buffer is 65535 so a single maximum-size handshake message
-    // always fits without the other side needing to be scheduled first.
-    //
-    // `flavor = "multi_thread"` is required on every test that uses this
-    // harness — the default single-threaded runtime brings the deadlock risk
-    // back even with spawn.
     // -----------------------------------------------------------------------
 
-    type Transport = PacketTransport<tokio::io::DuplexStream>;
+    type Tx = PacketTx<WriteHalf<DuplexStream>>;
+    type Rx = PacketRx<ReadHalf<DuplexStream>>;
 
     async fn connect_pair(
         server: NodeFixture,
         client: NodeFixture,
         verification_key: SignatureVerificationKey,
-    ) -> ((Transport, NodeId), Transport) {
+    ) -> ((Tx, Rx, NodeId), (Tx, Rx)) {
         let (client_stream, server_stream) = duplex(65537);
 
         let vk_server = verification_key.clone();
         let vk_client = verification_key.clone();
 
         let server_task = tokio::spawn(async move {
-            PacketTransport::accept(
+            accept(
                 server_stream,
                 &server.transport.private,
                 &server.auth_header,
@@ -468,7 +460,7 @@ mod tests {
         });
 
         let client_task = tokio::spawn(async move {
-            PacketTransport::connect(
+            connect(
                 client_stream,
                 server.node_id,
                 &client.transport.private,
@@ -480,14 +472,14 @@ mod tests {
 
         let (server_result, client_result) = tokio::join!(server_task, client_task);
 
-        let server_transport = server_result
+        let ((server_tx, server_rx), server_node_id) = server_result
             .expect("server task panicked")
             .expect("server handshake failed");
-        let client_transport = client_result
+        let (client_tx, client_rx) = client_result
             .expect("client task panicked")
             .expect("client handshake failed");
 
-        (server_transport, client_transport)
+        ((server_tx, server_rx, server_node_id), (client_tx, client_rx))
     }
 
     // -----------------------------------------------------------------------
@@ -499,7 +491,6 @@ mod tests {
         let cluster_kp = SignatureKeypair::generate().unwrap();
         let server = NodeFixture::new(1, &cluster_kp);
         let client = NodeFixture::new(2, &cluster_kp);
-        // reaching here without panic means both sides completed the handshake
         connect_pair(server, client, cluster_kp.public).await;
     }
 
@@ -510,15 +501,12 @@ mod tests {
         let client = NodeFixture::new(2, &cluster_kp);
         let expected_client_id = client.node_id.clone();
 
-        let ((_, remote_node_id), _) = connect_pair(server, client, cluster_kp.public).await;
+        let ((_, _, remote_node_id), _) = connect_pair(server, client, cluster_kp.public).await;
         assert_eq!(remote_node_id, expected_client_id);
     }
 
     // -----------------------------------------------------------------------
-    // Handshake — rejection: wrong cluster signing key
-    //
-    // The server signs its auth header with a rogue keypair. The client
-    // should reject it during the handshake.
+    // Handshake — rejection tests
     // -----------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread")]
@@ -538,7 +526,7 @@ mod tests {
         let vk_client = cluster_kp.public.clone();
 
         let server_task = tokio::spawn(async move {
-            PacketTransport::accept(
+            accept(
                 server_stream,
                 &server_transport.private,
                 &server_auth,
@@ -548,7 +536,7 @@ mod tests {
         });
 
         let client_task = tokio::spawn(async move {
-            PacketTransport::connect(
+            connect(
                 client_stream,
                 client_node_id,
                 &client.transport.private,
@@ -563,14 +551,8 @@ mod tests {
             .expect("client task panicked")
             .err()
             .expect("expected auth failure");
-        assert!(matches!(err, TransportError::BadAuth(_)), "got: {err:?}");
+        assert!(matches!(err, ConnectionError::BadAuth(_)), "got: {err:?}");
     }
-
-    // -----------------------------------------------------------------------
-    // Handshake — rejection: correct signature but wrong NodeId
-    //
-    // Client connects expecting node 1 but the server identifies as node 99.
-    // -----------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_rejects_mismatched_node_id() {
@@ -584,24 +566,11 @@ mod tests {
         let vk_client = cluster_kp.public.clone();
 
         let server_task = tokio::spawn(async move {
-            PacketTransport::accept(
-                server_stream,
-                &server.transport.private,
-                &server.auth_header,
-                &vk_server,
-            )
-            .await
+            accept(server_stream, &server.transport.private, &server.auth_header, &vk_server).await
         });
 
         let client_task = tokio::spawn(async move {
-            PacketTransport::connect(
-                client_stream,
-                wrong_target,
-                &client.transport.private,
-                &client.auth_header,
-                &vk_client,
-            )
-            .await
+            connect(client_stream, wrong_target, &client.transport.private, &client.auth_header, &vk_client).await
         });
 
         let (_, client_result) = tokio::join!(server_task, client_task);
@@ -610,19 +579,10 @@ mod tests {
             .err()
             .expect("expected node id mismatch");
         assert!(
-            matches!(err, TransportError::BadAuth(BadAuth::NodeIdMismatch { .. })),
+            matches!(err, ConnectionError::BadAuth(BadAuth::NodeIdMismatch { .. })),
             "got: {err:?}"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Handshake — rejection: static key mismatch
-    //
-    // The server presents a valid auth header claiming one public key but
-    // performs the Noise handshake with a different private key. The client
-    // should catch the mismatch between the Noise static key and the public
-    // key declared in the auth header.
-    // -----------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_rejects_static_key_mismatch() {
@@ -633,7 +593,6 @@ mod tests {
             .sign(&cluster_kp.private)
             .expect("sign failed");
 
-        // Actual handshake uses a different private key than the one declared.
         let actual_transport = TransportKeypair::generate().unwrap();
 
         let client = NodeFixture::new(2, &cluster_kp);
@@ -644,24 +603,11 @@ mod tests {
         let vk_client = cluster_kp.public.clone();
 
         let server_task = tokio::spawn(async move {
-            PacketTransport::accept(
-                server_stream,
-                &actual_transport.private,
-                &server_auth,
-                &vk_server,
-            )
-            .await
+            accept(server_stream, &actual_transport.private, &server_auth, &vk_server).await
         });
 
         let client_task = tokio::spawn(async move {
-            PacketTransport::connect(
-                client_stream,
-                client_node_id,
-                &client.transport.private,
-                &client.auth_header,
-                &vk_client,
-            )
-            .await
+            connect(client_stream, client_node_id, &client.transport.private, &client.auth_header, &vk_client).await
         });
 
         let (_, client_result) = tokio::join!(server_task, client_task);
@@ -670,16 +616,13 @@ mod tests {
             .err()
             .expect("expected key mismatch");
         assert!(
-            matches!(
-                err,
-                TransportError::BadAuth(BadAuth::PublicKeyMismatch { .. })
-            ),
+            matches!(err, ConnectionError::BadAuth(BadAuth::PublicKeyMismatch { .. })),
             "got: {err:?}"
         );
     }
 
     // -----------------------------------------------------------------------
-    // Transport I/O — small payload roundtrip
+    // Transport I/O
     // -----------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread")]
@@ -687,20 +630,17 @@ mod tests {
         let cluster_kp = SignatureKeypair::generate().unwrap();
         let server = NodeFixture::new(1, &cluster_kp);
         let client = NodeFixture::new(2, &cluster_kp);
-        let ((mut server_transport, _), mut client_transport) =
+        let ((_, mut server_rx, _), (mut client_tx, _)) =
             connect_pair(server, client, cluster_kp.public).await;
 
-        client_transport.prepare_message(1u8).unwrap();
-        client_transport
-            .send_slice(b"hello world", true)
-            .await
-            .unwrap();
+        client_tx.prepare_message(1u8).unwrap();
+        client_tx.send_slice(b"hello world", true).await.unwrap();
 
-        let packet = server_transport.read_packet().await.unwrap();
-        assert!(packet.first);
-        assert!(packet.last);
-        assert_eq!(packet.msg_type, 1);
-        assert_eq!(server_transport.packet_data(&packet), b"hello world");
+        let header = server_rx.read_packet().await.unwrap();
+        assert!(header.first);
+        assert!(header.last);
+        assert_eq!(header.msg_type, 1);
+        assert_eq!(server_rx.payload(), b"hello world");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -708,35 +648,25 @@ mod tests {
         let cluster_kp = SignatureKeypair::generate().unwrap();
         let server = NodeFixture::new(1, &cluster_kp);
         let client = NodeFixture::new(2, &cluster_kp);
-        let ((mut server_transport, _), mut client_transport) =
+        let ((_, mut server_rx, _), (mut client_tx, _)) =
             connect_pair(server, client, cluster_kp.public).await;
 
-        client_transport.prepare_message(0u8).unwrap();
-        client_transport.send_slice(&[], true).await.unwrap();
+        client_tx.prepare_message(0u8).unwrap();
+        client_tx.send_slice(&[], true).await.unwrap();
 
-        let packet = server_transport.read_packet().await.unwrap();
-        assert!(packet.first);
-        assert!(packet.last);
-        assert_eq!(client_transport.packet_data(&packet), EMPTY_PAYLOAD);
+        let header = server_rx.read_packet().await.unwrap();
+        assert!(header.first && header.last);
+        assert_eq!(server_rx.payload(), EMPTY_PAYLOAD);
     }
-
-    // -----------------------------------------------------------------------
-    // Transport I/O — large payload chunking
-    //
-    // A payload larger than MAX_PACKET_LEN must be split into multiple
-    // packets. We verify the reassembled data matches and that first/last
-    // flags are set correctly only on the first and final packets.
-    // -----------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread")]
     async fn roundtrip_large_payload_chunks_correctly() {
         let cluster_kp = SignatureKeypair::generate().unwrap();
         let server = NodeFixture::new(1, &cluster_kp);
         let client = NodeFixture::new(2, &cluster_kp);
-        let ((mut server_transport, _), mut client_transport) =
+        let ((_, mut server_rx, _), (mut client_tx, _)) =
             connect_pair(server, client, cluster_kp.public).await;
 
-        // Three full chunks plus a partial remainder.
         let data: Vec<u8> = (0u8..=255)
             .cycle()
             .take(MAX_PACKET_SIZE * 3 + 100)
@@ -744,89 +674,73 @@ mod tests {
         let to_send = data.clone();
 
         let client_task = tokio::spawn(async move {
-            client_transport.prepare_message(2u8).unwrap();
-            client_transport.send_slice(&to_send, true).await.unwrap();
+            client_tx.prepare_message(2u8).unwrap();
+            client_tx.send_slice(&to_send, true).await.unwrap();
         });
 
         let server_task = tokio::spawn(async move {
             let mut received = Vec::new();
             let mut packet_count = 0usize;
             loop {
-                let packet = server_transport.read_packet().await.unwrap();
+                let header = server_rx.read_packet().await.unwrap();
                 if packet_count == 0 {
-                    assert!(packet.first, "first packet must have first flag set");
+                    assert!(header.first, "first packet must have first flag set");
                 } else {
-                    assert!(
-                        !packet.first,
-                        "only the first packet should have first flag set"
-                    );
+                    assert!(!header.first, "only the first packet should have first flag set");
                 }
-                let data = server_transport.packet_data(&packet);
-                received.extend_from_slice(data);
+                received.extend_from_slice(server_rx.payload());
                 packet_count += 1;
-                if packet.last {
+                if header.last {
                     break;
                 }
             }
-
             (packet_count, received)
         });
 
         let (server_result, client_result) = tokio::join!(server_task, client_task);
-
         let (packet_count, received) = server_result.expect("server task panicked");
-
         assert_eq!(packet_count, 4, "expected 4 packets for this payload size");
         assert_eq!(received, data);
-
         client_result.expect("client task panicked");
     }
-
-    // -----------------------------------------------------------------------
-    // Transport I/O — bidirectional
-    // -----------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread")]
     async fn bidirectional_roundtrip() {
         let cluster_kp = SignatureKeypair::generate().unwrap();
         let server = NodeFixture::new(1, &cluster_kp);
         let client = NodeFixture::new(2, &cluster_kp);
-        let ((mut server_transport, _), mut client_transport) =
+        let ((mut server_tx, mut server_rx, _), (mut client_tx, mut client_rx)) =
             connect_pair(server, client, cluster_kp.public).await;
 
-        client_transport.prepare_message(1u8).unwrap();
-        client_transport.send_slice(b"ping", true).await.unwrap();
+        client_tx.prepare_message(1u8).unwrap();
+        client_tx.send_slice(b"ping", true).await.unwrap();
 
-        let ping = server_transport.read_packet().await.unwrap();
-        assert_eq!(server_transport.packet_data(&ping), b"ping");
+        server_rx.read_packet().await.unwrap();
+        assert_eq!(server_rx.payload(), b"ping");
 
-        server_transport.prepare_message(2u8).unwrap();
-        server_transport.send_slice(b"pong", true).await.unwrap();
+        server_tx.prepare_message(2u8).unwrap();
+        server_tx.send_slice(b"pong", true).await.unwrap();
 
-        let pong = client_transport.read_packet().await.unwrap();
-        assert_eq!(client_transport.packet_data(&pong), b"pong")
+        client_rx.read_packet().await.unwrap();
+        assert_eq!(client_rx.payload(), b"pong");
     }
-
-    // -----------------------------------------------------------------------
-    // Transport I/O — multiple sequential messages
-    // -----------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread")]
     async fn multiple_sequential_messages() {
         let cluster_kp = SignatureKeypair::generate().unwrap();
         let server = NodeFixture::new(1, &cluster_kp);
         let client = NodeFixture::new(2, &cluster_kp);
-        let ((mut server_transport, _), mut client_transport) =
+        let ((_, mut server_rx, _), (mut client_tx, _)) =
             connect_pair(server, client, cluster_kp.public).await;
 
         for i in 0u8..5 {
-            client_transport.prepare_message(i).unwrap();
+            client_tx.prepare_message(i).unwrap();
             let payload = vec![i; 64];
-            client_transport.send_slice(&payload, true).await.unwrap();
+            client_tx.send_slice(&payload, true).await.unwrap();
 
-            let packet = server_transport.read_packet().await.unwrap();
-            assert_eq!(packet.msg_type, i);
-            assert_eq!(server_transport.packet_data(&packet), payload.as_slice());
+            let header = server_rx.read_packet().await.unwrap();
+            assert_eq!(header.msg_type, i);
+            assert_eq!(server_rx.payload(), payload.as_slice());
         }
     }
 }

@@ -12,7 +12,7 @@ thiserror = { workspace = true }
 secrecy = { workspace = true }
 hex = { workspace = true }
 snow = { workspace = true }
-tokio = { workspace = true, features = ["net", "io-util"] }
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
  
 [dev-dependencies]
 serde_json = { workspace = true }

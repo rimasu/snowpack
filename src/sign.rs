@@ -8,24 +8,35 @@ use rand_core::OsRng;
 use secrecy::{ExposeSecret, Secret};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::KeyGenError;
+use crate::{KeyGenError, MalformedKeyError};
 
-#[derive(Debug, thiserror::Error)]
-#[error("malformed signature key")]
-pub struct MalformedKeyError;
-
+/// An error verifying a signed record.
+///
+/// Returned by [`SignatureVerificationKey::verify`]. A record is only returned
+/// to the caller when the signature is valid *and* the payload deserializes
+/// successfully; any other outcome produces one of these variants.
 #[derive(thiserror::Error, Debug, Eq, PartialEq)]
 pub enum SignatureValidationErr {
+    /// The input is shorter than a signature (64 bytes), so there is no
+    /// payload to verify.
     #[error("malformed record")]
     MalformedRecord,
 
+    /// The Ed25519 signature did not verify against the provided key.
     #[error("bad signature")]
     BadSignature,
 
+    /// The signature was valid but the payload could not be deserialized
+    /// into the requested type.
     #[error("record deserialization {0:?}")]
     RecordDeserialization(postcard::Error),
 }
 
+/// An error signing a record.
+///
+/// Returned by [`SignatureSigningKey::sign`]. The only failure mode is
+/// postcard serialization of the record — types that implement `Serialize`
+/// correctly should not fail in practice.
 #[derive(thiserror::Error, Debug)]
 pub enum SigningErr {
     #[error("record serialization {0:?}")]

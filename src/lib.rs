@@ -64,7 +64,7 @@
 //! // Server side: accept a connection and recover the peer's NodeId.
 //! let listener = TcpListener::bind("0.0.0.0:7000").await?;
 //! let (stream, _) = listener.accept().await?;
-//! let (mut transport, peer_id): (_, NodeId) = accept(
+//! let ((mut tx, mut rx), peer_id): (_, NodeId) = accept(
 //!     stream,
 //!     &transport_keys.private,
 //!     &auth,
@@ -74,7 +74,7 @@
 //! // Client side: connect and assert the peer is who we expect.
 //! let stream = TcpStream::connect("peer:7000").await?;
 //! let expected_peer = NodeId::try_from_bytes(b"node-2".to_vec())?;
-//! let mut transport = connect(
+//! let (mut tx, mut rx) = connect(
 //!     stream,
 //!     expected_peer,
 //!     &transport_keys.private,
@@ -97,24 +97,23 @@
 //! [noise]: https://noiseprotocol.org
 
 mod auth;
-mod keys;
-mod message_transport;
+mod messages;
 mod node_id;
 mod noise;
-mod packet;
-mod packet_transport;
+mod packet_state;
+mod packets;
 mod sign;
 
 pub use auth::{AuthHeader, BadAuth, MalformedAuthHeader, SignedAuthHeader};
-pub use keys::{MalformedKeyError, TransportKeypair, TransportPrivateKey, TransportPublicKey};
-pub use message_transport::{Message, MessagePackets, MessageTransport};
-pub use node_id::{NodeId, NodeIdTooLong};
-pub use packet_transport::TransportError;
+pub use noise::{TransportKeypair, TransportPrivateKey, TransportPublicKey};
+pub use messages::{Message, MessagePackets, MessageRx, MessageTx};
+pub use node_id::{NodeId, NodeIdTooLong, MAX_NODE_ID_LEN};
+pub use packet_state::PacketBuildError;
+pub use packet_state::PacketReadError;
+pub use packets::ConnectionError;
 pub use sign::{SignatureKeypair, SignatureSigningKey, SignatureVerificationKey, SigningErr};
 
-use tokio::io::{AsyncRead, AsyncWrite};
-
-use crate::packet_transport::PacketTransport;
+use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 
 /// Complete a Noise XX handshake as the **responder** (server side).
 ///
@@ -122,26 +121,25 @@ use crate::packet_transport::PacketTransport;
 /// confirms the Noise static key matches the one declared in the header,
 /// and converts the remote [`NodeId`] to `N` via [`TryFrom`].
 ///
-/// Returns the authenticated message transport and the peer's identity.
+/// Returns the authenticated message transport halves and the peer's identity.
 pub async fn accept<S, N>(
     stream: S,
     local_private: &TransportPrivateKey,
     local_auth_header: &SignedAuthHeader,
     verification_key: &SignatureVerificationKey,
-) -> Result<(MessageTransport<S>, N), TransportError>
+) -> Result<((MessageTx<WriteHalf<S>>, MessageRx<ReadHalf<S>>), N), ConnectionError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     N: TryFrom<NodeId>,
     N::Error: std::error::Error + Send + Sync + 'static,
 {
-    let (packet_transport, node_id) =
-        PacketTransport::accept(stream, local_private, local_auth_header, verification_key).await?;
+    let ((tx, rx), node_id) =
+        packets::accept(stream, local_private, local_auth_header, verification_key).await?;
 
     let n = N::try_from(node_id)
-        .map_err(|e| TransportError::InvalidNodeId(e.to_string()))?;
+        .map_err(|e| ConnectionError::InvalidNodeId(e.to_string()))?;
 
-    let message_transport = MessageTransport::new(packet_transport);
-    Ok((message_transport, n))
+    Ok(((MessageTx::new(tx), MessageRx::new(rx)), n))
 }
 
 /// Complete a Noise XX handshake as the **initiator** (client side).
@@ -150,19 +148,19 @@ where
 /// confirms the Noise static key matches the one declared in the header,
 /// and asserts the authenticated peer identity equals `target`.
 ///
-/// Returns the authenticated message transport.
+/// Returns the authenticated message transport halves.
 pub async fn connect<S, N>(
     stream: S,
     target: N,
     local_private: &TransportPrivateKey,
     local_auth_header: &SignedAuthHeader,
     verification_key: &SignatureVerificationKey,
-) -> Result<MessageTransport<S>, TransportError>
+) -> Result<(MessageTx<WriteHalf<S>>, MessageRx<ReadHalf<S>>), ConnectionError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     N: Into<NodeId>,
 {
-    let packet_transport = PacketTransport::connect(
+    let (tx, rx) = packets::connect(
         stream,
         target,
         local_private,
@@ -170,11 +168,24 @@ where
         verification_key,
     )
     .await?;
-    let message_transport = MessageTransport::new(packet_transport);
-    Ok(message_transport)
+    Ok((MessageTx::new(tx), MessageRx::new(rx)))
 }
 
-/// Error returned when keypair generation fails.
+/// Returned when a key cannot be parsed.
+///
+/// Produced by the `TryFrom` impls on [`TransportPublicKey`], [`TransportPrivateKey`],
+/// [`SignatureVerificationKey`], and [`SignatureSigningKey`] when the hex string is
+/// invalid, the byte length is wrong, or (for ED25519 keys) the bytes are not a
+/// valid curve point.
+#[derive(thiserror::Error, Debug)]
+#[error("malformed key")]
+pub struct MalformedKeyError;
+
+/// Returned when keypair generation fails.
+///
+/// Produced by [`TransportKeypair::generate`] and [`SignatureKeypair::generate`].
+/// In practice this can only happen if the OS RNG is unavailable or if the
+/// Noise builder rejects the generated key material.
 #[derive(thiserror::Error, Debug)]
 #[error("key gen: {0}")]
 pub struct KeyGenError(pub(crate) String);

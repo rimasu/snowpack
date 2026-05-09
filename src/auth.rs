@@ -5,10 +5,16 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::{
     NodeId,
-    keys::TransportPublicKey,
+    noise::TransportPublicKey,
     sign::{SignatureSigningKey, SignatureValidationErr, SignatureVerificationKey, SigningErr},
 };
 
+/// An authentication failure during the Noise XX handshake.
+///
+/// Covers three distinct failure modes: a bad cluster signature, a static-key
+/// mismatch (the Noise static key does not match the key declared in the auth
+/// header), and a node-identity mismatch (the authenticated peer is not who
+/// the caller expected).
 #[derive(thiserror::Error, Debug, Eq, PartialEq)]
 pub enum BadAuth {
     #[error(transparent)]
@@ -24,16 +30,25 @@ pub enum BadAuth {
     NodeIdMismatch { expected: NodeId, actual: NodeId },
 }
 
+/// Returned when a hex string cannot be decoded into a [`SignedAuthHeader`].
+///
+/// The bytes are not validated at construction time — signature and identity
+/// checks are deferred to [`SignedAuthHeader::verify`].
 #[derive(thiserror::Error, Debug, Eq, PartialEq)]
 #[error("malformed auth header")]
 pub struct MalformedAuthHeader;
 
-/// Auth header
+/// The identity and transport public key of a node, used to authenticate Noise handshakes.
 ///
-/// The signed version of this is used for authentication of the transport connection.
+/// Built by the node operator and signed with the cluster's [`SignatureSigningKey`] via
+/// [`sign`][AuthHeader::sign] to produce a [`SignedAuthHeader`]. The signed header is
+/// carried as a payload in the Noise XX handshake; the receiving peer verifies the
+/// signature against the cluster [`SignatureVerificationKey`] and confirms the declared
+/// public key matches the Noise static key to rule out header replay.
 ///
-/// To support live upgrade, changes to this struct
-/// should be performed in a backwards compatible manner.
+/// Forward-compatibility note: the postcard encoding of this struct is included in the
+/// signed payload, so any changes to field names or order will invalidate existing
+/// signed headers.
 #[derive(Eq, PartialEq, Debug, Serialize, Deserialize)]
 pub struct AuthHeader {
     node_id: NodeId,
@@ -84,6 +99,13 @@ impl AuthHeader {
     }
 }
 
+/// A signed [`AuthHeader`] carried as the payload of a Noise XX handshake message.
+///
+/// Produced by [`AuthHeader::sign`] and verified by [`SignedAuthHeader::verify`].
+/// The raw bytes are wrapped in [`secrecy::SecretVec`] and redacted in `Debug`
+/// output; use [`expose`][SignedAuthHeader::expose] or
+/// [`expose_to_human_string`][SignedAuthHeader::expose_to_human_string]
+/// where the bytes must be accessed explicitly.
 #[derive(Clone)]
 pub struct SignedAuthHeader(Arc<SecretVec<u8>>);
 
@@ -155,7 +177,7 @@ mod tests {
     use crate::{
         NodeId,
         auth::{AuthHeader, BadAuth, MalformedAuthHeader, SignedAuthHeader},
-        keys::TransportPublicKey,
+        noise::TransportPublicKey,
         sign::{SignatureKeypair, SignatureValidationErr},
     };
 
