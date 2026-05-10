@@ -173,6 +173,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HandshakeContext<S> {
         Ok(TransportPublicKey::from(arr))
     }
 
+    // S is always split into WriteHalf/ReadHalf by design; a type alias would
+    // obscure the relationship between the stream type and the two halves.
+    #[allow(clippy::type_complexity)]
     fn into_split(self) -> Result<(PacketTx<WriteHalf<S>>, PacketRx<ReadHalf<S>>), ConnectionError> {
         let state = Arc::new(Mutex::new(self.handshake.into_transport_mode()?));
         let (read, write) = split(self.stream);
