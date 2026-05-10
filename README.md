@@ -1,0 +1,127 @@
+# snowpack
+
+## snowpack
+
+An authenticated, encrypted transport for long-lived connections between
+known peers, built on the [Noise protocol framework][noise] (XX pattern,
+X25519 + AES-GCM + BLAKE2b).
+
+### Design intent
+
+Snowpack is built for **inter-node links in a cluster or mesh** — situations
+where a fixed set of nodes all need to talk to each other and every node is
+both a potential initiator and responder. This is a different problem from
+the typical client-server model:
+
+- **Mutual authentication**: every connection authenticates both ends. There
+  is no notion of an anonymous client; an unrecognised peer cannot connect.
+- **No CA infrastructure**: authentication is built on a single
+  [`SignatureKeypair`] the cluster operator generates. The [`SignatureVerificationKey`]
+  (public half) is distributed to every node. The signing key (private half)
+  can be handled in two ways depending on your security requirements:
+  - *Shared signing key* — distribute the signing key to every node so each
+    can sign its own headers and new nodes can be added without operator
+    involvement. Simpler to operate; a compromised node can mint credentials
+    for arbitrary identities.
+  - *Offline signing* — the operator signs an [`AuthHeader`] for each node
+    offline and distributes only the resulting [`SignedAuthHeader`]. The
+    signing key never reaches any node. Harder to rotate membership; a
+    compromised node cannot forge new credentials.
+- **Stable long-lived connections**: the framed transport is designed for
+  persistent connections that carry many messages over their lifetime, not
+  short request/response exchanges.
+
+If you need to authenticate arbitrary external clients, or if you want
+browser/TLS compatibility, snowpack is the wrong tool — reach for TLS with
+a proper PKI instead.
+
+### What snowpack provides
+
+- A **Noise XX handshake** that mutually authenticates both peers using
+  ED25519-signed auth headers carried as handshake payloads. Each peer
+  proves it holds the private key matching the public key it declares,
+  and that declaration is signed by a shared cluster key.
+- A **framed message transport** layered on top of the encrypted channel.
+  Messages are split into packets of up to 65519 bytes, each tagged with
+  a 6-bit type discriminant. Up to 64 message types are supported.
+- **Key and signing utilities** for generating and managing the X25519
+  transport keypairs and ED25519 cluster signing keypairs needed to
+  operate the handshake.
+
+### What snowpack does not provide
+
+- Multiplexing: one connection carries one ordered stream of messages.
+- Request/response matching: the caller is responsible for protocol logic
+  above the message layer.
+- A specific node identity type: [`NodeId`] is an opaque byte vector.
+  Callers map their own identity type to and from `NodeId` via [`Into`]
+  and [`TryFrom`].
+
+### Handshake and identity model
+
+Every node has:
+- An **X25519 transport keypair** ([`TransportKeypair`]) used in the Noise
+  handshake.
+- A **signed auth header** ([`SignedAuthHeader`]) containing the node's
+  [`NodeId`] and transport public key, signed by the cluster's
+  [`SignatureSigningKey`].
+
+During the XX handshake, each peer sends its signed auth header as the
+handshake payload and verifies the other's against the shared
+[`SignatureVerificationKey`]. The Noise layer additionally confirms that
+the static key used in the handshake matches the public key declared in
+the auth header, preventing impersonation even if an auth header is stolen.
+
+### Quick start
+
+```rust
+use snowpack::{
+    accept, connect,
+    AuthHeader, SignedAuthHeader,
+    NodeId, TransportKeypair, SignatureKeypair, SignatureVerificationKey,
+};
+use tokio::net::{TcpListener, TcpStream};
+
+// Generate keys (in practice, load these from config).
+let cluster_keys = SignatureKeypair::generate()?;
+let transport_keys = TransportKeypair::generate()?;
+let my_id = NodeId::try_from_bytes(b"node-1".to_vec())?;
+
+// Build a signed auth header for this node.
+let auth = AuthHeader::new(my_id, &transport_keys.public)
+    .sign(&cluster_keys.private)?;
+
+// Server side: accept a connection and recover the peer's NodeId.
+let listener = TcpListener::bind("0.0.0.0:7000").await?;
+let (stream, _) = listener.accept().await?;
+let ((mut tx, mut rx), peer_id): (_, NodeId) = accept(
+    stream,
+    &transport_keys.private,
+    &auth,
+    &cluster_keys.public,
+).await?;
+
+// Client side: connect and assert the peer is who we expect.
+let stream = TcpStream::connect("peer:7000").await?;
+let expected_peer = NodeId::try_from_bytes(b"node-2".to_vec())?;
+let (mut tx, mut rx) = connect(
+    stream,
+    expected_peer,
+    &transport_keys.private,
+    &auth,
+    &cluster_keys.public,
+).await?;
+```
+
+### Security notes
+
+- The Noise XX pattern provides mutual authentication and forward secrecy.
+- Auth header payloads are opaque to snowpack; the caller is responsible
+  for the contents of [`NodeId`].
+- Private key material ([`TransportPrivateKey`], [`SignatureSigningKey`])
+  is wrapped in [`secrecy::Secret`], which zeroes memory on drop and
+  redacts values in `Debug` output.
+
+[noise]: https://noiseprotocol.org
+
+License: MIT OR Apache-2.0
