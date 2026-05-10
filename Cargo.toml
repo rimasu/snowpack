@@ -2,6 +2,12 @@
 name = "snowpack"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Authenticated encrypted transport for inter-node links, built on the Noise XX protocol"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/..."
+keywords = ["noise", "encryption", "authentication", "p2p", "cluster"]
+categories = ["network-programming", "cryptography", "authentication"]
 
 [dependencies]
 ed25519-dalek = { workspace = true }

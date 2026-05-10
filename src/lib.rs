@@ -4,6 +4,35 @@
 //! known peers, built on the [Noise protocol framework][noise] (XX pattern,
 //! X25519 + AES-GCM + BLAKE2b).
 //!
+//! ## Design intent
+//!
+//! Snowpack is built for **inter-node links in a cluster or mesh** — situations
+//! where a fixed set of nodes all need to talk to each other and every node is
+//! both a potential initiator and responder. This is a different problem from
+//! the typical client-server model:
+//!
+//! - **Mutual authentication**: every connection authenticates both ends. There
+//!   is no notion of an anonymous client; an unrecognised peer cannot connect.
+//! - **No CA infrastructure**: authentication is built on a single
+//!   [`SignatureKeypair`] the cluster operator generates. The [`SignatureVerificationKey`]
+//!   (public half) is distributed to every node. The signing key (private half)
+//!   can be handled in two ways depending on your security requirements:
+//!   - *Shared signing key* — distribute the signing key to every node so each
+//!     can sign its own headers and new nodes can be added without operator
+//!     involvement. Simpler to operate; a compromised node can mint credentials
+//!     for arbitrary identities.
+//!   - *Offline signing* — the operator signs an [`AuthHeader`] for each node
+//!     offline and distributes only the resulting [`SignedAuthHeader`]. The
+//!     signing key never reaches any node. Harder to rotate membership; a
+//!     compromised node cannot forge new credentials.
+//! - **Stable long-lived connections**: the framed transport is designed for
+//!   persistent connections that carry many messages over their lifetime, not
+//!   short request/response exchanges.
+//!
+//! If you need to authenticate arbitrary external clients, or if you want
+//! browser/TLS compatibility, snowpack is the wrong tool — reach for TLS with
+//! a proper PKI instead.
+//!
 //! ## What snowpack provides
 //!
 //! - A **Noise XX handshake** that mutually authenticates both peers using
