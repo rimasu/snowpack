@@ -18,7 +18,9 @@ thiserror = "2"
 secrecy = { version = "0.8", features = ["serde"] }
 hex = "0.4"
 snow = { version = "0.9", features = ["default-resolver"] }
-tokio = { version = "1", default-features = false, features = ["net", "io-util", "time"] }
+tokio = { version = "1", default-features = false, features = ["net", "io-util", "time", "sync", "rt"] }
+metrics = "0.24"
+tracing = "0.1"
 
 [dev-dependencies]
 serde_json = "1"

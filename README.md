@@ -1,7 +1,5 @@
 # snowpack
 
-## snowpack
-
 An authenticated, encrypted transport for long-lived connections between
 known peers, built on the [Noise protocol framework][noise] (XX pattern,
 X25519 + AES-GCM + BLAKE2b).
@@ -44,6 +42,9 @@ a proper PKI instead.
 - A **framed message transport** layered on top of the encrypted channel.
   Messages are split into packets of up to 65519 bytes, each tagged with
   a 6-bit type discriminant. Up to 64 message types are supported.
+- A **`ConnectionPool`** that maintains one authenticated,
+  auto-reconnecting connection per peer, with a commit/reset `Guard`
+  that handles mid-RPC cancellation safely.
 - **Key and signing utilities** for generating and managing the X25519
   transport keypairs and ED25519 cluster signing keypairs needed to
   operate the handshake.
@@ -112,6 +113,36 @@ let (mut tx, mut rx) = connect(
     &cluster_keys.public,
 ).await?;
 ```
+
+### Connection pool
+
+For multi-peer cluster communication, `ConnectionPool` maintains one
+authenticated, auto-reconnecting connection per peer. Implement `Connector`
+for your stream type, build a pool from your node's `Credentials`, then
+call `peer()` to get a logical handle:
+
+```rust
+use std::sync::Arc;
+use snowpack::{ConnectionPool, Credentials, Connector, ConnectionError};
+
+// pool.peer() returns a Connection — a cheap, cloneable handle.
+let conn = pool.peer(peer_id, || MyConnector::new("peer:7000"));
+
+// Acquire exclusive access for one RPC exchange.
+match conn.acquire().await {
+    Ok(mut guard) => {
+        let (tx, rx) = guard.transport();
+        tx.send_message(1u8, &request).await?;
+        let response = rx.read_message().await?.decode::<MyResponse>().await?;
+        guard.commit(); // release the lock cleanly
+    }
+    Err(_) => { /* still connecting — back off and retry */ }
+}
+```
+
+Dropping a `Guard` without `commit()` signals that the Noise channel may be
+in an inconsistent state (e.g. due to a cancelled future). The pool resets
+and reconnects in the background automatically.
 
 ### Security notes
 

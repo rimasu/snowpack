@@ -42,6 +42,9 @@
 //! - A **framed message transport** layered on top of the encrypted channel.
 //!   Messages are split into packets of up to 65519 bytes, each tagged with
 //!   a 6-bit type discriminant. Up to 64 message types are supported.
+//! - A **[`ConnectionPool`]** that maintains one authenticated,
+//!   auto-reconnecting connection per peer, with a commit/reset [`Guard`]
+//!   that handles mid-RPC cancellation safely.
 //! - **Key and signing utilities** for generating and managing the X25519
 //!   transport keypairs and ED25519 cluster signing keypairs needed to
 //!   operate the handshake.
@@ -131,6 +134,7 @@ mod node_id;
 mod noise;
 mod packet_state;
 mod packets;
+mod pool;
 mod sign;
 
 pub use auth::{AuthHeader, BadAuth, MalformedAuthHeader, SignedAuthHeader};
@@ -140,6 +144,7 @@ pub use node_id::{NodeId, NodeIdTooLong, MAX_NODE_ID_LEN};
 pub use packet_state::PacketBuildError;
 pub use packet_state::PacketReadError;
 pub use packets::ConnectionError;
+pub use pool::{Connection, ConnectionPool, Connector, Credentials, Guard, NotReady, TcpConnector};
 pub use sign::{SignatureKeypair, SignatureSigningKey, SignatureVerificationKey, SigningErr};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};

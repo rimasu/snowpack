@@ -19,7 +19,7 @@ pub struct NodeIdTooLong(usize);
 /// to [`MAX_NODE_ID_LEN`] bytes), or from integer types via the `From<u32>` and
 /// `From<u64>` impls (big-endian encoded). Snowpack treats the bytes as opaque;
 /// callers are responsible for choosing a globally unique identity scheme.
-#[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
+#[derive(Eq, PartialEq, Hash, Debug, Clone, Serialize, Deserialize)]
 pub struct NodeId(Vec<u8>);
 
 
