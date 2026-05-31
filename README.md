@@ -1,5 +1,7 @@
 # snowpack
 
+[![CI](https://github.com/rimasu/snowpack/actions/workflows/ci.yml/badge.svg)](https://github.com/rimasu/snowpack/actions/workflows/ci.yml)
+
 An authenticated, encrypted transport for long-lived connections between
 known peers, built on the [Noise protocol framework][noise] (XX pattern,
 X25519 + AES-GCM + BLAKE2b).
