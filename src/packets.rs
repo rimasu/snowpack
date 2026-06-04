@@ -13,6 +13,7 @@ use tokio::time::timeout;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 use crate::NodeId;
+use crate::auth::AuthDetails;
 use crate::auth::BadAuth;
 use crate::auth::SignedAuthHeader;
 use crate::noise::TransportPrivateKey;
@@ -207,13 +208,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HandshakeContext<S> {
 /// Verifies the initiator's signed auth header with `verification_key` and
 /// confirms that the Noise static key matches the one in the header.
 ///
-/// Returns the split transport pair and the authenticated remote [`NodeId`].
+/// Returns the split transport pair and the authenticated details.
 pub(crate) async fn accept<S>(
     stream: S,
     local_private: &TransportPrivateKey,
     local_auth_header: &SignedAuthHeader,
     verification_key: &SignatureVerificationKey,
-) -> Result<((PacketTx<WriteHalf<S>>, PacketRx<ReadHalf<S>>), NodeId), ConnectionError>
+) -> Result<((PacketTx<WriteHalf<S>>, PacketRx<ReadHalf<S>>), AuthDetails), ConnectionError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -232,8 +233,9 @@ where
 
         remote_auth_header.validate_public_key(&hs.remote_static()?)?;
 
-        let node_id = remote_auth_header.node_id().clone();
-        Ok((hs.into_split()?, node_id))
+        let details = remote_auth_header.into();
+
+        Ok((hs.into_split()?, details))
     })
     .await
     .map_err(|_| ConnectionError::HandshakeTimeout)?
@@ -241,21 +243,18 @@ where
 
 /// Complete a Noise XX handshake as the **initiator** (client side).
 ///
-/// Verifies the responder's signed auth header with `verification_key`,
-/// confirms the static key matches, and asserts that the authenticated
-/// [`NodeId`] equals `target`.
+/// Verifies the responder's signed auth header with `verification_key` and
+/// confirms the static key matches.
 ///
-/// Returns the split transport pair.
-pub(crate) async fn connect<S, N>(
+/// Returns the split transport pair and the authenticated details.
+pub(crate) async fn connect<S>(
     stream: S,
-    target: N,
     local_private: &TransportPrivateKey,
     local_auth_header: &SignedAuthHeader,
     verification_key: &SignatureVerificationKey,
-) -> Result<(PacketTx<WriteHalf<S>>, PacketRx<ReadHalf<S>>), ConnectionError>
+) -> Result<((PacketTx<WriteHalf<S>>, PacketRx<ReadHalf<S>>), AuthDetails), ConnectionError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    N: Into<NodeId>,
 {
     timeout(HANDSHAKE_TIMEOUT, async {
         let mut hs = HandshakeContext::new_initiator(stream, local_private)?;
@@ -268,12 +267,12 @@ where
         let remote_auth_header = SignedAuthHeader::verify_raw(verification_key, payload)?;
 
         remote_auth_header.validate_public_key(&hs.remote_static()?)?;
-        remote_auth_header.validate_node_id(target)?;
 
         // XX msg 3: → s, se  (carry our signed auth header as payload)
         hs.send(local_auth_header.expose()).await?;
 
-        hs.into_split()
+        let details = remote_auth_header.into();
+        Ok((hs.into_split()?, details))
     })
     .await
     .map_err(|_| ConnectionError::HandshakeTimeout)?
@@ -425,8 +424,7 @@ mod tests {
         fn new(node_id: u64, cluster_kp: &SignatureKeypair) -> Self {
             let transport = TransportKeypair::generate().expect("keygen failed");
             let auth_header = AuthHeader::new(NodeId::from(node_id), &transport.public)
-                .sign(&cluster_kp.private)
-                .expect("sign failed");
+                .sign(&cluster_kp.private);
             Self {
                 node_id: NodeId::from(node_id),
                 transport,
@@ -465,7 +463,6 @@ mod tests {
         let client_task = tokio::spawn(async move {
             connect(
                 client_stream,
-                server.node_id,
                 &client.transport.private,
                 &client.auth_header,
                 &vk_client,
@@ -475,14 +472,14 @@ mod tests {
 
         let (server_result, client_result) = tokio::join!(server_task, client_task);
 
-        let ((server_tx, server_rx), server_node_id) = server_result
+        let ((server_tx, server_rx), auth_details) = server_result
             .expect("server task panicked")
             .expect("server handshake failed");
-        let (client_tx, client_rx) = client_result
+        let ((client_tx, client_rx), _) = client_result
             .expect("client task panicked")
             .expect("client handshake failed");
 
-        ((server_tx, server_rx, server_node_id), (client_tx, client_rx))
+        ((server_tx, server_rx, auth_details.node_id), (client_tx, client_rx))
     }
 
     // -----------------------------------------------------------------------
@@ -519,11 +516,9 @@ mod tests {
 
         let server_transport = TransportKeypair::generate().unwrap();
         let server_auth = AuthHeader::new(NodeId::from(1u32), &server_transport.public)
-            .sign(&rogue_kp.private)
-            .expect("sign failed");
+            .sign(&rogue_kp.private);
 
         let client = NodeFixture::new(2, &cluster_kp);
-        let client_node_id = client.node_id;
 
         let (client_stream, server_stream) = duplex(65535);
         let vk_client = cluster_kp.public.clone();
@@ -541,7 +536,6 @@ mod tests {
         let client_task = tokio::spawn(async move {
             connect(
                 client_stream,
-                client_node_id,
                 &client.transport.private,
                 &client.auth_header,
                 &vk_client,
@@ -558,48 +552,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn connect_rejects_mismatched_node_id() {
-        let cluster_kp = SignatureKeypair::generate().unwrap();
-        let server = NodeFixture::new(99, &cluster_kp);
-        let client = NodeFixture::new(2, &cluster_kp);
-        let wrong_target = NodeId::from(1u32);
-
-        let (client_stream, server_stream) = duplex(65535);
-        let vk_server = cluster_kp.public.clone();
-        let vk_client = cluster_kp.public.clone();
-
-        let server_task = tokio::spawn(async move {
-            accept(server_stream, &server.transport.private, &server.auth_header, &vk_server).await
-        });
-
-        let client_task = tokio::spawn(async move {
-            connect(client_stream, wrong_target, &client.transport.private, &client.auth_header, &vk_client).await
-        });
-
-        let (_, client_result) = tokio::join!(server_task, client_task);
-        let err = client_result
-            .expect("client task panicked")
-            .err()
-            .expect("expected node id mismatch");
-        assert!(
-            matches!(err, ConnectionError::BadAuth(BadAuth::NodeIdMismatch { .. })),
-            "got: {err:?}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn connect_rejects_static_key_mismatch() {
         let cluster_kp = SignatureKeypair::generate().unwrap();
 
         let declared_transport = TransportKeypair::generate().unwrap();
         let server_auth = AuthHeader::new(1u32, &declared_transport.public)
-            .sign(&cluster_kp.private)
-            .expect("sign failed");
+            .sign(&cluster_kp.private);
 
         let actual_transport = TransportKeypair::generate().unwrap();
 
         let client = NodeFixture::new(2, &cluster_kp);
-        let client_node_id = client.node_id;
 
         let (client_stream, server_stream) = duplex(65535);
         let vk_server = cluster_kp.public.clone();
@@ -610,7 +572,7 @@ mod tests {
         });
 
         let client_task = tokio::spawn(async move {
-            connect(client_stream, client_node_id, &client.transport.private, &client.auth_header, &vk_client).await
+            connect(client_stream, &client.transport.private, &client.auth_header, &vk_client).await
         });
 
         let (_, client_result) = tokio::join!(server_task, client_task);

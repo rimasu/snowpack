@@ -78,7 +78,7 @@
 //! ```no_run
 //! use snowpack::{
 //!     accept, connect,
-//!     AuthHeader, SignedAuthHeader,
+//!     AuthDetails, AuthHeader, SignedAuthHeader,
 //!     NodeId, TransportKeypair, SignatureKeypair, SignatureVerificationKey,
 //! };
 //! use tokio::net::{TcpListener, TcpStream};
@@ -91,24 +91,22 @@
 //!
 //! // Build a signed auth header for this node.
 //! let auth = AuthHeader::new(my_id, &transport_keys.public)
-//!     .sign(&cluster_keys.private)?;
+//!     .sign(&cluster_keys.private);
 //!
 //! // Server side: accept a connection and recover the peer's NodeId.
 //! let listener = TcpListener::bind("0.0.0.0:7000").await?;
 //! let (stream, _) = listener.accept().await?;
-//! let ((mut tx, mut rx), peer_id): (_, NodeId) = accept(
+//! let ((mut tx, mut rx), peer_id): (_, AuthDetails) = accept(
 //!     stream,
 //!     &transport_keys.private,
 //!     &auth,
 //!     &cluster_keys.public,
 //! ).await?;
 //!
-//! // Client side: connect and assert the peer is who we expect.
+//! // Client side: connect and verify the peer's identity from AuthDetails.
 //! let stream = TcpStream::connect("peer:7000").await?;
-//! let expected_peer = NodeId::try_from_bytes(b"node-2".to_vec())?;
-//! let (mut tx, mut rx) = connect(
+//! let ((mut tx, mut rx), peer) = connect(
 //!     stream,
-//!     expected_peer,
 //!     &transport_keys.private,
 //!     &auth,
 //!     &cluster_keys.public,
@@ -137,7 +135,7 @@ mod packets;
 mod pool;
 mod sign;
 
-pub use auth::{AuthHeader, BadAuth, MalformedAuthHeader, SignedAuthHeader};
+pub use auth::{AuthDetails, AuthHeader, BadAuth, MalformedAuthHeader, SignedAuthHeader};
 pub use noise::{TransportKeypair, TransportPrivateKey, TransportPublicKey};
 pub use messages::{Message, MessagePackets, MessageRx, MessageTx};
 pub use node_id::{NodeId, NodeIdTooLong, MAX_NODE_ID_LEN};
@@ -145,64 +143,62 @@ pub use packet_state::PacketBuildError;
 pub use packet_state::PacketReadError;
 pub use packets::ConnectionError;
 pub use pool::{Connection, ConnectionPool, Connector, Credentials, Guard, NotReady, TcpConnector};
-pub use sign::{SignatureKeypair, SignatureSigningKey, SignatureVerificationKey, SigningErr};
+pub use sign::{SignatureKeypair, SignatureSigningKey, SignatureVerificationKey};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 
+
 /// Complete a Noise XX handshake as the **responder** (server side).
 ///
-/// Verifies the initiator's signed auth header against `verification_key`,
-/// confirms the Noise static key matches the one declared in the header,
-/// and converts the remote [`NodeId`] to `N` via [`TryFrom`].
+/// Verifies the initiator's signed auth header against `verification_key` and
+/// confirms the Noise static key matches the one declared in the header.
 ///
-/// Returns the authenticated message transport halves and the peer's identity.
-pub async fn accept<S, N>(
+/// Returns the authenticated message transport halves and [`AuthDetails`].
+/// The caller is responsible for making appropriate checks on the peer's
+/// identity — during discovery this may be how the peer's node id is first
+/// learned; when accepting from a known set, verify it is a permitted peer.
+pub async fn accept<S>(
     stream: S,
     local_private: &TransportPrivateKey,
     local_auth_header: &SignedAuthHeader,
     verification_key: &SignatureVerificationKey,
-) -> Result<((MessageTx<WriteHalf<S>>, MessageRx<ReadHalf<S>>), N), ConnectionError>
+) -> Result<((MessageTx<WriteHalf<S>>, MessageRx<ReadHalf<S>>), AuthDetails), ConnectionError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
-    N: TryFrom<NodeId>,
-    N::Error: std::error::Error + Send + Sync + 'static,
+    S: AsyncRead + AsyncWrite + Unpin
 {
-    let ((tx, rx), node_id) =
+    let ((tx, rx), auth_details) =
         packets::accept(stream, local_private, local_auth_header, verification_key).await?;
 
-    let n = N::try_from(node_id)
-        .map_err(|e| ConnectionError::InvalidNodeId(e.to_string()))?;
 
-    Ok(((MessageTx::new(tx), MessageRx::new(rx)), n))
+    Ok(((MessageTx::new(tx), MessageRx::new(rx)), auth_details))
 }
 
 /// Complete a Noise XX handshake as the **initiator** (client side).
 ///
-/// Verifies the responder's signed auth header against `verification_key`,
-/// confirms the Noise static key matches the one declared in the header,
-/// and asserts the authenticated peer identity equals `target`.
+/// Verifies the responder's signed auth header against `verification_key` and
+/// confirms the Noise static key matches the one declared in the header.
 ///
-/// Returns the authenticated message transport halves.
-pub async fn connect<S, N>(
+/// Returns the authenticated message transport halves and [`AuthDetails`].
+/// The caller is responsible for making appropriate checks on the peer's
+/// identity — during discovery this establishes who was reached; when
+/// reconnecting, verify it matches the expected peer.
+pub async fn connect<S>(
     stream: S,
-    target: N,
     local_private: &TransportPrivateKey,
     local_auth_header: &SignedAuthHeader,
     verification_key: &SignatureVerificationKey,
-) -> Result<(MessageTx<WriteHalf<S>>, MessageRx<ReadHalf<S>>), ConnectionError>
+) -> Result<((MessageTx<WriteHalf<S>>, MessageRx<ReadHalf<S>>), AuthDetails), ConnectionError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    N: Into<NodeId>,
 {
-    let (tx, rx) = packets::connect(
+    let ((tx, rx), auth_details) = packets::connect(
         stream,
-        target,
         local_private,
         local_auth_header,
         verification_key,
     )
     .await?;
-    Ok((MessageTx::new(tx), MessageRx::new(rx)))
+    Ok(((MessageTx::new(tx), MessageRx::new(rx)), auth_details))
 }
 
 /// Returned when a key cannot be parsed.

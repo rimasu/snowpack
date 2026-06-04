@@ -190,9 +190,9 @@ mod tests {
         let server_id = NodeId::from(1u64);
 
         let server_auth = AuthHeader::new(server_id.clone(), &server_tp.public)
-            .sign(&cluster_kp.private).unwrap();
+            .sign(&cluster_kp.private);
         let client_auth = AuthHeader::new(NodeId::from(2u64), &client_tp.public)
-            .sign(&cluster_kp.private).unwrap();
+            .sign(&cluster_kp.private);
 
         let (client_stream, server_stream) = duplex(65537);
         let vk_s = cluster_kp.public.clone();
@@ -203,7 +203,7 @@ mod tests {
             (MessageTx::new(tx), MessageRx::new(rx))
         });
         let client_task = tokio::spawn(async move {
-            let (tx, rx) = connect(client_stream, server_id, &client_tp.private, &client_auth, &vk_c).await.unwrap();
+            let ((tx, rx), _) = connect(client_stream, &client_tp.private, &client_auth, &vk_c).await.unwrap();
             (MessageTx::new(tx), MessageRx::new(rx))
         });
 

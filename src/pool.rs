@@ -119,14 +119,15 @@ async fn try_connect<C: Connector>(
     link: &PeerLink<C>,
 ) -> Result<(MessageTx<WriteHalf<C::Stream>>, MessageRx<ReadHalf<C::Stream>>), ConnectionError> {
     let stream = link.connector.connect().await?;
-    crate::connect(
+    let ((tx, rx), auth_details) = crate::connect(
         stream,
-        link.target.clone(),
         &link.creds.private_key,
         &link.creds.auth_header,
         &link.creds.verification_key,
     )
-    .await
+    .await?;
+    auth_details.check_node_id(link.target.clone())?;
+    Ok((tx, rx))
 }
 
 // ── ConnectionPool ────────────────────────────────────────────────────────────
@@ -292,13 +293,12 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use tokio::io::DuplexStream;
 
-    use crate::{AuthHeader, SignatureKeypair, TransportKeypair, accept};
+    use crate::{auth::AuthHeader, SignatureKeypair, TransportKeypair, accept};
 
     fn peer_credentials(cluster: &SignatureKeypair, id: u32) -> Credentials {
         let keypair = TransportKeypair::generate().unwrap();
         let auth = AuthHeader::new(NodeId::from(id), &keypair.public)
-            .sign(&cluster.private)
-            .unwrap();
+            .sign(&cluster.private);
         Credentials {
             private_key: keypair.private,
             auth_header: auth,
@@ -355,7 +355,7 @@ mod tests {
 
         let (server_result, pool) = tokio::join!(
             async move {
-                accept::<_, NodeId>(server_stream, &server_private, &server_auth, &server_vk).await
+                accept::<_>(server_stream, &server_private, &server_auth, &server_vk).await
             },
             async move {
                 let pool: ConnectionPool<OneShotConnector> = ConnectionPool::new(Arc::new(client_creds));

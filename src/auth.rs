@@ -7,7 +7,7 @@ use yatlv::{FrameBuilder, FrameBuilderLike, FrameParser};
 use crate::{
     NodeId,
     noise::TransportPublicKey,
-    sign::{SignatureSigningKey, SignatureValidationErr, SignatureVerificationKey, SigningErr},
+    sign::{SignatureSigningKey, SignatureValidationErr, SignatureVerificationKey},
 };
 
 const TAG_NODE_ID: u16 = 1;
@@ -41,6 +41,45 @@ pub enum BadAuth {
 #[derive(thiserror::Error, Debug, Eq, PartialEq)]
 #[error("malformed auth header")]
 pub struct MalformedAuthHeader;
+
+
+/// Details returned when a successful connection is established.
+///
+/// The caller is responsible for making appropriate checks on these details
+/// before trusting the connection. During discovery this may be how the peer's
+/// identity is first learned; when reconnecting the caller should verify it
+/// matches the expected peer.
+#[must_use = "check the authenticated peer details before using the connection"]
+#[derive(Debug, PartialEq)]
+pub struct AuthDetails {
+    pub node_id: NodeId,
+}
+
+impl AuthDetails {
+    /// Verify the authenticated peer's node id matches `expected`.
+    ///
+    /// Use this when reconnecting to a known peer. During initial discovery,
+    /// read [`node_id`][AuthDetails::node_id] directly to learn the peer's identity.
+    pub fn check_node_id<N: Into<NodeId>>(&self, expected: N) -> Result<(), BadAuth> {
+        let expected = expected.into();
+        if self.node_id == expected {
+            Ok(())
+        } else {
+            Err(BadAuth::NodeIdMismatch {
+                expected,
+                actual: self.node_id.clone(),
+            })
+        }
+    }
+}
+
+impl From<AuthHeader> for AuthDetails {
+    fn from(value: AuthHeader) -> Self {
+        AuthDetails {
+            node_id: value.node_id
+        }
+    }
+}
 
 /// The identity and transport public key of a node, used to authenticate Noise handshakes.
 ///
@@ -77,18 +116,6 @@ impl AuthHeader {
         }
     }
 
-    pub fn validate_node_id<N: Into<NodeId>>(&self, node_id: N) -> Result<(), BadAuth> {
-        let expected = node_id.into();
-        if self.node_id == expected {
-            Ok(())
-        } else {
-            Err(BadAuth::NodeIdMismatch {
-                actual: expected,
-                expected: self.node_id.clone(),
-            })
-        }
-    }
-
     pub fn node_id(&self) -> &NodeId {
         &self.node_id
     }
@@ -117,10 +144,10 @@ impl AuthHeader {
         })
     }
 
-    pub fn sign(&self, signing_key: &SignatureSigningKey) -> Result<SignedAuthHeader, SigningErr> {
+    pub fn sign(&self, signing_key: &SignatureSigningKey) -> SignedAuthHeader {
         let payload = self.to_yatlv();
-        let raw = signing_key.sign_raw(&payload);
-        Ok(SignedAuthHeader(Arc::new(SecretVec::new(raw))))
+        let raw = signing_key.sign(&payload);
+        SignedAuthHeader(Arc::new(SecretVec::new(raw)))
     }
 }
 
@@ -203,7 +230,7 @@ impl<'de> Deserialize<'de> for SignedAuthHeader {
 mod tests {
     use crate::{
         NodeId,
-        auth::{AuthHeader, BadAuth, MalformedAuthHeader, SignedAuthHeader},
+        auth::{AuthDetails, AuthHeader, BadAuth, MalformedAuthHeader, SignedAuthHeader},
         noise::TransportPublicKey,
         sign::{SignatureKeypair, SignatureValidationErr},
     };
@@ -227,7 +254,7 @@ mod tests {
     fn signed(node_id: u32) -> (SignatureKeypair, SignedAuthHeader) {
         let kp = cluster_keypair();
         let header = auth_header(node_id);
-        let signed = header.sign(&kp.private).expect("sign failed");
+        let signed = header.sign(&kp.private);
         (kp, signed)
     }
 
@@ -267,41 +294,6 @@ mod tests {
 
         assert_eq!(expected, transport_public_key());
         assert_eq!(actual, wrong);
-    }
-
-    // -----------------------------------------------------------------------
-    // AuthHeader::validate_node_id
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn validate_node_id_accepts_matching_id() {
-        let header = auth_header(42);
-        assert!(header.validate_node_id(42u32).is_ok());
-    }
-
-    #[test]
-    fn validate_node_id_rejects_wrong_id() {
-        let header = auth_header(42);
-
-        let err = header.validate_node_id(99u32).unwrap_err();
-        assert!(
-            matches!(err, BadAuth::NodeIdMismatch { .. }),
-            "expected NodeIdMismatch, got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn validate_node_id_mismatch_contains_both_ids() {
-        let header = auth_header(42);
-
-        let BadAuth::NodeIdMismatch { expected, actual } =
-            header.validate_node_id(99u32).unwrap_err()
-        else {
-            panic!("expected NodeIdMismatch variant");
-        };
-
-        assert_eq!(expected, NodeId::from(42u32));
-        assert_eq!(actual, NodeId::from(99u32));
     }
 
     // -----------------------------------------------------------------------
@@ -537,8 +529,8 @@ mod tests {
         let header_a = AuthHeader::new(NodeId::from(1u32), &key);
         let header_b = AuthHeader::new(NodeId::from(2u32), &key);
 
-        let signed_a = header_a.sign(&kp.private).unwrap();
-        let signed_b = header_b.sign(&kp.private).unwrap();
+        let signed_a = header_a.sign(&kp.private);
+        let signed_b = header_b.sign(&kp.private);
 
         // Credentials must differ even with the same transport key.
         assert_ne!(signed_a.expose(), signed_b.expose());
@@ -555,22 +547,32 @@ mod tests {
     }
 
     #[test]
-    fn credential_from_node_a_does_not_validate_as_node_b() {
+    fn check_node_id_rejects_wrong_peer() {
         let kp = cluster_keypair();
         let key = transport_public_key();
 
         let signed_a = AuthHeader::new(NodeId::from(1u32), &key)
-            .sign(&kp.private)
-            .unwrap();
-        let recovered = signed_a.verify(&kp.public).unwrap();
+            .sign(&kp.private);
+        let details: AuthDetails = signed_a.verify(&kp.public).unwrap().into();
 
-        // Verifies fine, but node id check catches the mismatch.
         assert_eq!(
-            recovered.validate_node_id(NodeId::from(2u32)),
+            details.check_node_id(NodeId::from(2u32)),
             Err(BadAuth::NodeIdMismatch {
-                expected: 1u32.into(),
-                actual: 2u32.into()
+                expected: 2u32.into(),
+                actual: 1u32.into(),
             })
         );
+    }
+
+    #[test]
+    fn check_node_id_accepts_correct_peer() {
+        let kp = cluster_keypair();
+        let key = transport_public_key();
+
+        let signed_a = AuthHeader::new(NodeId::from(1u32), &key)
+            .sign(&kp.private);
+        let details: AuthDetails = signed_a.verify(&kp.public).unwrap().into();
+
+        assert!(details.check_node_id(NodeId::from(1u32)).is_ok());
     }
 }

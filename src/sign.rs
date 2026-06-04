@@ -12,9 +12,7 @@ use crate::{KeyGenError, MalformedKeyError};
 
 /// An error verifying a signed record.
 ///
-/// Returned by [`SignatureVerificationKey::verify`]. A record is only returned
-/// to the caller when the signature is valid *and* the payload deserializes
-/// successfully; any other outcome produces one of these variants.
+/// Returned by [`SignatureVerificationKey::verify_payload`].
 #[derive(thiserror::Error, Debug, Eq, PartialEq)]
 pub enum SignatureValidationErr {
     /// The input is shorter than a signature (64 bytes), so there is no
@@ -25,22 +23,6 @@ pub enum SignatureValidationErr {
     /// The Ed25519 signature did not verify against the provided key.
     #[error("bad signature")]
     BadSignature,
-
-    /// The signature was valid but the payload could not be deserialized
-    /// into the requested type.
-    #[error("record deserialization {0:?}")]
-    RecordDeserialization(postcard::Error),
-}
-
-/// An error signing a record.
-///
-/// Returned by [`SignatureSigningKey::sign`]. The only failure mode is
-/// postcard serialization of the record — types that implement `Serialize`
-/// correctly should not fail in practice.
-#[derive(thiserror::Error, Debug)]
-pub enum SigningErr {
-    #[error("record serialization {0:?}")]
-    RecordSerialization(postcard::Error),
 }
 
 const SIGNATURE_LEN: usize = 64;
@@ -75,17 +57,6 @@ impl SignatureVerificationKey {
             .verify_strict(payload, &signature)
             .map_err(|_| SignatureValidationErr::BadSignature)?;
         Ok(payload)
-    }
-
-    /// Verify signature and deserialize.
-    ///
-    /// The record is only returned if the signature is valid.
-    pub fn verify<'a, R>(&self, record: &'a [u8]) -> Result<R, SignatureValidationErr>
-    where
-        R: Deserialize<'a>,
-    {
-        let payload = self.verify_payload(record)?;
-        postcard::from_bytes(payload).map_err(SignatureValidationErr::RecordDeserialization)
     }
 }
 
@@ -183,19 +154,7 @@ impl SignatureSigningKey {
         hex::encode(self.0.expose_secret())
     }
 
-    pub fn sign<R>(&self, record: &R) -> Result<Vec<u8>, SigningErr>
-    where
-        R: Serialize,
-    {
-        let signing_key = SigningKey::from_bytes(self.0.expose_secret());
-        let mut record_data =
-            postcard::to_allocvec(record).map_err(SigningErr::RecordSerialization)?;
-        let sig = signing_key.sign(&record_data);
-        record_data.extend(sig.to_bytes());
-        Ok(record_data)
-    }
-
-    pub fn sign_raw(&self, payload: &[u8]) -> Vec<u8> {
+    pub fn sign(&self, payload: &[u8]) -> Vec<u8> {
         let signing_key = SigningKey::from_bytes(self.0.expose_secret());
         let sig = signing_key.sign(payload);
         let mut result = payload.to_vec();
@@ -282,19 +241,7 @@ impl SignatureKeypair {
 
 #[cfg(test)]
 mod tests {
-    use serde::{Deserialize, Serialize};
-
     use super::*;
-
-    #[derive(Debug, PartialEq, Serialize, Deserialize)]
-    struct Record {
-        id: u32,
-        label: String,
-    }
-
-    /// Serializes to zero bytes in postcard — signed blob is exactly 64 bytes.
-    #[derive(Debug, PartialEq, Serialize, Deserialize)]
-    struct UnitRecord;
 
     fn keypair() -> SignatureKeypair {
         SignatureKeypair::generate().expect("keypair generation failed")
@@ -317,8 +264,6 @@ mod tests {
 
     #[test]
     fn generated_public_key_matches_private() {
-        // expose() returns the 32-byte secret seed. Derive the verifying key
-        // from it and confirm it matches the stored public key.
         let kp = keypair();
         let derived = SigningKey::from_bytes(kp.private.expose());
         assert_eq!(
@@ -329,72 +274,45 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // sign / verify — happy path
+    // sign / verify_payload — happy path
     // -----------------------------------------------------------------------
 
     #[test]
-    fn sign_verify_round_trip() {
+    fn sign_verify_payload_round_trip() {
         let kp = keypair();
-        let original = Record {
-            id: 1,
-            label: "hello".into(),
-        };
-
-        let signed = kp.private.sign(&original).expect("sign failed");
-        let recovered: Record = kp.public.verify(&signed).expect("verify failed");
-
-        assert_eq!(original, recovered);
+        let payload = b"hello world";
+        let signed = kp.private.sign(payload);
+        let recovered = kp.public.verify_payload(&signed).unwrap();
+        assert_eq!(recovered, payload);
     }
 
     #[test]
-    fn sign_verify_unit_record() {
-        // Payload is zero bytes; signed blob should be exactly 64 bytes.
+    fn sign_length_is_payload_plus_signature() {
         let kp = keypair();
-        let signed = kp.private.sign(&UnitRecord).expect("sign failed");
-        assert_eq!(
-            signed.len(),
-            SIGNATURE_LEN,
-            "signed unit record must be exactly 64 bytes"
-        );
-
-        let _: UnitRecord = kp
-            .public
-            .verify(&signed)
-            .expect("verify of unit record failed");
+        let payload = b"test";
+        let signed = kp.private.sign(payload);
+        assert_eq!(signed.len(), payload.len() + SIGNATURE_LEN);
     }
 
     #[test]
-    fn signed_blob_length_is_payload_plus_signature() {
+    fn sign_empty_payload() {
         let kp = keypair();
-        let record = Record {
-            id: 99,
-            label: "len".into(),
-        };
-
-        let payload_only = postcard::to_allocvec(&record).unwrap();
-        let signed = kp.private.sign(&record).expect("sign failed");
-
-        assert_eq!(signed.len(), payload_only.len() + SIGNATURE_LEN);
+        let signed = kp.private.sign(&[]);
+        assert_eq!(signed.len(), SIGNATURE_LEN);
+        let recovered = kp.public.verify_payload(&signed).unwrap();
+        assert_eq!(recovered, &[] as &[u8]);
     }
 
     // -----------------------------------------------------------------------
-    // verify — rejection cases
+    // verify_payload — rejection cases
     // -----------------------------------------------------------------------
 
     #[test]
-    fn verify_rejects_wrong_key() {
+    fn verify_payload_rejects_wrong_key() {
         let signer = keypair();
         let other = keypair();
-
-        let signed = signer
-            .private
-            .sign(&Record {
-                id: 2,
-                label: "x".into(),
-            })
-            .unwrap();
-        let result: Result<Record, _> = other.public.verify(&signed);
-
+        let signed = signer.private.sign(b"data");
+        let result = other.public.verify_payload(&signed);
         assert!(
             matches!(result, Err(SignatureValidationErr::BadSignature)),
             "wrong key must return BadSignature, got: {result:?}"
@@ -402,74 +320,44 @@ mod tests {
     }
 
     #[test]
-    fn verify_rejects_empty_input() {
+    fn verify_payload_rejects_empty_input() {
         let kp = keypair();
-        let result: Result<Record, _> = kp.public.verify(&[]);
         assert!(matches!(
-            result,
+            kp.public.verify_payload(&[]),
             Err(SignatureValidationErr::MalformedRecord)
         ));
     }
 
     #[test]
-    fn verify_rejects_input_shorter_than_signature() {
+    fn verify_payload_rejects_input_shorter_than_signature() {
         let kp = keypair();
         let short = vec![0u8; SIGNATURE_LEN - 1];
-        let result: Result<Record, _> = kp.public.verify(&short);
         assert!(matches!(
-            result,
+            kp.public.verify_payload(&short),
             Err(SignatureValidationErr::MalformedRecord)
         ));
     }
 
     #[test]
-    fn verify_rejects_payload_bit_flip() {
+    fn verify_payload_rejects_payload_bit_flip() {
         let kp = keypair();
-        let record = Record {
-            id: 3,
-            label: "flip".into(),
-        };
-        let mut signed = kp.private.sign(&record).unwrap();
-
-        // Corrupt the first byte of the payload (not the signature trailer).
+        let mut signed = kp.private.sign(b"flip");
         signed[0] ^= 0xFF;
-
-        let result: Result<Record, _> = kp.public.verify(&signed);
         assert!(
-            matches!(result, Err(SignatureValidationErr::BadSignature)),
+            matches!(kp.public.verify_payload(&signed), Err(SignatureValidationErr::BadSignature)),
             "tampered payload must return BadSignature"
         );
     }
 
     #[test]
-    fn verify_rejects_signature_bit_flip() {
+    fn verify_payload_rejects_signature_bit_flip() {
         let kp = keypair();
-        let record = Record {
-            id: 4,
-            label: "flipsig".into(),
-        };
-        let mut signed = kp.private.sign(&record).unwrap();
-
-        // Corrupt the last byte of the signature trailer.
+        let mut signed = kp.private.sign(b"flipsig");
         *signed.last_mut().unwrap() ^= 0xFF;
-
-        let result: Result<Record, _> = kp.public.verify(&signed);
-        assert!(matches!(result, Err(SignatureValidationErr::BadSignature)));
-    }
-
-    #[test]
-    fn verify_rejects_type_mismatch() {
-        // A valid signature over a UnitRecord must not deserialize as Record.
-        let kp = keypair();
-        let signed = kp.private.sign(&UnitRecord).unwrap();
-        let result: Result<Record, _> = kp.public.verify(&signed);
-        assert!(
-            matches!(
-                result,
-                Err(SignatureValidationErr::RecordDeserialization(_))
-            ),
-            "signature-valid but type-mismatched payload must return RecordDeserialization"
-        );
+        assert!(matches!(
+            kp.public.verify_payload(&signed),
+            Err(SignatureValidationErr::BadSignature)
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -502,7 +390,6 @@ mod tests {
     fn verification_key_from_str_round_trip() {
         let kp = keypair();
         let hex = kp.public.to_string();
-
         let restored = SignatureVerificationKey::try_from(hex.as_str())
             .expect("TryFrom<&str> failed on valid hex");
         assert_eq!(kp.public, restored);
@@ -515,7 +402,6 @@ mod tests {
 
     #[test]
     fn verification_key_from_str_rejects_wrong_length() {
-        // 31 bytes → 62 hex chars: valid hex but wrong key length.
         let short = "aa".repeat(31);
         assert!(SignatureVerificationKey::try_from(short.as_str()).is_err());
     }
@@ -534,49 +420,30 @@ mod tests {
         assert_eq!(hex_str.len(), 64);
         assert!(hex_str.chars().all(|c| c.is_ascii_hexdigit()));
 
-        // Can't compare SignatureSigningKey directly (no PartialEq), so verify
-        // the restored key produces a blob the original public key accepts.
+        // Verify the restored key produces a blob the original public key accepts.
         let restored: SignatureSigningKey = serde_json::from_str(&json).unwrap();
-        let record = Record {
-            id: 5,
-            label: "restoredkey".into(),
-        };
-        let signed = restored.sign(&record).unwrap();
-        let recovered: Record = kp.public.verify(&signed).unwrap();
-        assert_eq!(record, recovered);
+        let signed = restored.sign(b"test");
+        kp.public.verify_payload(&signed).unwrap();
     }
 
     #[test]
     fn signing_key_postcard_round_trip() {
         let kp = keypair();
         let bytes = postcard::to_allocvec(&kp.private).unwrap();
-
         let restored: SignatureSigningKey = postcard::from_bytes(&bytes).unwrap();
-        let record = Record {
-            id: 6,
-            label: "binarykey".into(),
-        };
-        let signed = restored.sign(&record).unwrap();
-        let recovered: Record = kp.public.verify(&signed).unwrap();
-        assert_eq!(record, recovered);
+        let signed = restored.sign(b"test");
+        kp.public.verify_payload(&signed).unwrap();
     }
 
     #[test]
     fn signing_key_expose_to_human_string_round_trip() {
         let kp = keypair();
         let hex = kp.private.expose_to_human_string();
-        // 32-byte secret → 64-char hex string.
         assert_eq!(hex.len(), 64);
-
-        let restored =
-            SignatureSigningKey::try_from(hex.as_str()).expect("TryFrom<&str> failed on valid hex");
-
-        let record = Record {
-            id: 7,
-            label: "expose".into(),
-        };
-        let signed = restored.sign(&record).unwrap();
-        let _: Record = kp.public.verify(&signed).unwrap();
+        let restored = SignatureSigningKey::try_from(hex.as_str())
+            .expect("TryFrom<&str> failed on valid hex");
+        let signed = restored.sign(b"test");
+        kp.public.verify_payload(&signed).unwrap();
     }
 
     #[test]
@@ -587,45 +454,7 @@ mod tests {
             debug.contains("[redacted]"),
             "debug output must not expose key bytes, got: {debug}"
         );
-        // Confirm the actual secret bytes don't appear in the output.
         let key_hex = kp.private.expose_to_human_string();
         assert!(!debug.contains(&key_hex));
-    }
-
-    // -----------------------------------------------------------------------
-    // Cross-struct compatibility (module goal 3)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn compatible_structs_can_exchange_records() {
-        // Sender and receiver have separately defined but layout-compatible
-        // structs. postcard is not self-describing, so field order must match.
-        #[derive(Serialize)]
-        struct SenderRecord {
-            id: u32,
-            label: String,
-        }
-
-        #[derive(Deserialize, Debug, PartialEq)]
-        struct ReceiverRecord {
-            id: u32,
-            label: String,
-        }
-
-        let kp = keypair();
-        let sent = SenderRecord {
-            id: 42,
-            label: "compat".into(),
-        };
-        let signed = kp.private.sign(&sent).unwrap();
-
-        let received: ReceiverRecord = kp.public.verify(&signed).unwrap();
-        assert_eq!(
-            received,
-            ReceiverRecord {
-                id: 42,
-                label: "compat".into()
-            }
-        );
     }
 }
