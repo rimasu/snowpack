@@ -2,12 +2,16 @@ use std::{fmt, sync::Arc};
 
 use secrecy::{ExposeSecret, SecretVec};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use yatlv::{FrameBuilder, FrameBuilderLike, FrameParser};
 
 use crate::{
     NodeId,
     noise::TransportPublicKey,
     sign::{SignatureSigningKey, SignatureValidationErr, SignatureVerificationKey, SigningErr},
 };
+
+const TAG_NODE_ID: u16 = 1;
+const TAG_PUBLIC_KEY: u16 = 2;
 
 /// An authentication failure during the Noise XX handshake.
 ///
@@ -46,10 +50,9 @@ pub struct MalformedAuthHeader;
 /// signature against the cluster [`SignatureVerificationKey`] and confirms the declared
 /// public key matches the Noise static key to rule out header replay.
 ///
-/// Forward-compatibility note: the postcard encoding of this struct is included in the
-/// signed payload, so any changes to field names or order will invalidate existing
-/// signed headers.
-#[derive(Eq, PartialEq, Debug, Serialize, Deserialize)]
+/// Serialized as a yatlv frame (tag 1 = node_id bytes, tag 2 = public key bytes).
+/// Adding new tags in future is forwards-compatible; existing signed headers remain valid.
+#[derive(Eq, PartialEq, Debug)]
 pub struct AuthHeader {
     node_id: NodeId,
     public_key: TransportPublicKey,
@@ -92,10 +95,32 @@ impl AuthHeader {
 }
 
 impl AuthHeader {
+    fn to_yatlv(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut bld = FrameBuilder::new(&mut buf);
+            bld.add_data(TAG_NODE_ID, self.node_id.as_bytes());
+            bld.add_data(TAG_PUBLIC_KEY, self.public_key.as_bytes());
+        }
+        buf
+    }
+
+    fn from_yatlv(data: &[u8]) -> Result<Self, MalformedAuthHeader> {
+        let parser = FrameParser::new(data).map_err(|_| MalformedAuthHeader)?;
+        let node_id_bytes = parser.get_data(TAG_NODE_ID).map_err(|_| MalformedAuthHeader)?;
+        let public_key_bytes = parser.get_data(TAG_PUBLIC_KEY).map_err(|_| MalformedAuthHeader)?;
+        let node_id = NodeId::try_from_bytes(node_id_bytes.to_vec()).map_err(|_| MalformedAuthHeader)?;
+        let public_key_arr: [u8; 32] = public_key_bytes.try_into().map_err(|_| MalformedAuthHeader)?;
+        Ok(AuthHeader {
+            node_id,
+            public_key: TransportPublicKey(public_key_arr),
+        })
+    }
+
     pub fn sign(&self, signing_key: &SignatureSigningKey) -> Result<SignedAuthHeader, SigningErr> {
-        signing_key
-            .sign(self)
-            .map(|raw| SignedAuthHeader(Arc::new(SecretVec::new(raw))))
+        let payload = self.to_yatlv();
+        let raw = signing_key.sign_raw(&payload);
+        Ok(SignedAuthHeader(Arc::new(SecretVec::new(raw))))
     }
 }
 
@@ -117,7 +142,9 @@ impl SignedAuthHeader {
     /// Verifies a raw byte slice directly, for use when the signed header
     /// arrives as a noise handshake payload buffer rather than a typed instance.
     pub fn verify_raw(key: &SignatureVerificationKey, data: &[u8]) -> Result<AuthHeader, BadAuth> {
-        Ok(key.verify(data)?)
+        let payload = key.verify_payload(data)?;
+        AuthHeader::from_yatlv(payload)
+            .map_err(|_| BadAuth::Signature(SignatureValidationErr::MalformedRecord))
     }
 
     pub fn expose(&self) -> &[u8] {

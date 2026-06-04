@@ -61,13 +61,8 @@ impl SignatureVerificationKey {
         self.0.as_bytes()
     }
 
-    /// Verify signature and deserialize.
-    ///
-    /// The record is only returned if the signature is valid.
-    pub fn verify<'a, R>(&self, record: &'a [u8]) -> Result<R, SignatureValidationErr>
-    where
-        R: Deserialize<'a>,
-    {
+    /// Verify signature and return the raw payload bytes.
+    pub fn verify_payload<'a>(&self, record: &'a [u8]) -> Result<&'a [u8], SignatureValidationErr> {
         if record.len() < SIGNATURE_LEN {
             return Err(SignatureValidationErr::MalformedRecord);
         }
@@ -76,11 +71,20 @@ impl SignatureVerificationKey {
         let signature_data = &record[payload_len..];
         let signature = Signature::from_slice(signature_data)
             .map_err(|_| SignatureValidationErr::MalformedRecord)?;
-
         self.0
             .verify_strict(payload, &signature)
             .map_err(|_| SignatureValidationErr::BadSignature)?;
+        Ok(payload)
+    }
 
+    /// Verify signature and deserialize.
+    ///
+    /// The record is only returned if the signature is valid.
+    pub fn verify<'a, R>(&self, record: &'a [u8]) -> Result<R, SignatureValidationErr>
+    where
+        R: Deserialize<'a>,
+    {
+        let payload = self.verify_payload(record)?;
         postcard::from_bytes(payload).map_err(SignatureValidationErr::RecordDeserialization)
     }
 }
@@ -189,6 +193,14 @@ impl SignatureSigningKey {
         let sig = signing_key.sign(&record_data);
         record_data.extend(sig.to_bytes());
         Ok(record_data)
+    }
+
+    pub fn sign_raw(&self, payload: &[u8]) -> Vec<u8> {
+        let signing_key = SigningKey::from_bytes(self.0.expose_secret());
+        let sig = signing_key.sign(payload);
+        let mut result = payload.to_vec();
+        result.extend(sig.to_bytes());
+        result
     }
 }
 

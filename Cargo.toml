@@ -10,6 +10,7 @@ keywords = ["noise", "encryption", "authentication", "p2p", "cluster"]
 categories = ["network-programming", "cryptography", "authentication"]
 
 [dependencies]
+yatlv = { path = "../yatlv", default-features = false }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
