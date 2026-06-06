@@ -12,7 +12,6 @@ use tokio::time::timeout;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-use crate::NodeId;
 use crate::auth::AuthDetails;
 use crate::auth::BadAuth;
 use crate::auth::SignedAuthHeader;
