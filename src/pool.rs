@@ -297,7 +297,7 @@ mod tests {
 
     fn peer_credentials(cluster: &SignatureKeypair, id: u32) -> Credentials {
         let keypair = TransportKeypair::generate().unwrap();
-        let auth = AuthHeader::new(NodeId::from(id), &keypair.public)
+        let auth = AuthHeader::new(NodeId::from(id), None, &keypair.public)
             .sign(&cluster.private);
         Credentials {
             private_key: keypair.private,

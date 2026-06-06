@@ -180,9 +180,9 @@ mod tests {
 
         let server_id = NodeId::from(1u64);
 
-        let server_auth = AuthHeader::new(server_id.clone(), &server_tp.public)
+        let server_auth = AuthHeader::new(server_id.clone(), None, &server_tp.public)
             .sign(&cluster_kp.private);
-        let client_auth = AuthHeader::new(NodeId::from(2u64), &client_tp.public)
+        let client_auth = AuthHeader::new(NodeId::from(2u64), None, &client_tp.public)
             .sign(&cluster_kp.private);
 
         let (client_stream, server_stream) = duplex(65537);
