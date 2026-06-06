@@ -419,7 +419,7 @@ mod tests {
     impl NodeFixture {
         fn new(node_id: u64, cluster_kp: &SignatureKeypair) -> Self {
             let transport = TransportKeypair::generate().expect("keygen failed");
-            let auth_header = AuthHeader::new(NodeId::from(node_id), &transport.public)
+            let auth_header = AuthHeader::new(NodeId::from(node_id), None, &transport.public)
                 .sign(&cluster_kp.private);
             Self {
                 node_id: NodeId::from(node_id),
@@ -511,7 +511,7 @@ mod tests {
         let rogue_kp = SignatureKeypair::generate().unwrap();
 
         let server_transport = TransportKeypair::generate().unwrap();
-        let server_auth = AuthHeader::new(NodeId::from(1u32), &server_transport.public)
+        let server_auth = AuthHeader::new(NodeId::from(1u32), None, &server_transport.public)
             .sign(&rogue_kp.private);
 
         let client = NodeFixture::new(2, &cluster_kp);
@@ -552,7 +552,7 @@ mod tests {
         let cluster_kp = SignatureKeypair::generate().unwrap();
 
         let declared_transport = TransportKeypair::generate().unwrap();
-        let server_auth = AuthHeader::new(1u32, &declared_transport.public)
+        let server_auth = AuthHeader::new(1u32, None, &declared_transport.public)
             .sign(&cluster_kp.private);
 
         let actual_transport = TransportKeypair::generate().unwrap();

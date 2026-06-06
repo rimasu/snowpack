@@ -90,7 +90,7 @@
 //! let my_id = NodeId::try_from_bytes(b"node-1".to_vec())?;
 //!
 //! // Build a signed auth header for this node.
-//! let auth = AuthHeader::new(my_id, &transport_keys.public)
+//! let auth = AuthHeader::new(my_id, None, &transport_keys.public)
 //!     .sign(&cluster_keys.private);
 //!
 //! // Server side: accept a connection and recover the peer's NodeId.

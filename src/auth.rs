@@ -13,6 +13,7 @@ use crate::{
 
 const TAG_NODE_ID: u16 = 1;
 const TAG_PUBLIC_KEY: u16 = 2;
+const TAG_ROLE: u16 = 3;
 
 /// An authentication failure during the Noise XX handshake.
 ///
@@ -54,6 +55,7 @@ pub struct MalformedAuthHeader;
 #[derive(Debug, PartialEq)]
 pub struct AuthDetails {
     pub node_id: NodeId,
+    pub role: Option<Vec<u8>>,
 }
 
 impl AuthDetails {
@@ -77,7 +79,8 @@ impl AuthDetails {
 impl From<AuthHeader> for AuthDetails {
     fn from(value: AuthHeader) -> Self {
         AuthDetails {
-            node_id: value.node_id
+            node_id: value.node_id,
+            role: value.role,
         }
     }
 }
@@ -95,13 +98,15 @@ impl From<AuthHeader> for AuthDetails {
 #[derive(Eq, PartialEq, Debug)]
 pub struct AuthHeader {
     node_id: NodeId,
+    role: Option<Vec<u8>>,
     public_key: TransportPublicKey,
 }
 
 impl AuthHeader {
-    pub fn new<N: Into<NodeId>>(node_id: N, public_key: &TransportPublicKey) -> Self {
+    pub fn new<N: Into<NodeId>>(node_id: N, role: Option<&[u8]>, public_key: &TransportPublicKey) -> Self {
         Self {
             node_id: node_id.into(),
+            role: role.map(|r| r.to_vec()),
             public_key: public_key.clone(),
         }
     }
@@ -116,10 +121,6 @@ impl AuthHeader {
             })
         }
     }
-
-    pub fn node_id(&self) -> &NodeId {
-        &self.node_id
-    }
 }
 
 impl AuthHeader {
@@ -129,6 +130,9 @@ impl AuthHeader {
             let mut bld = FrameBuilder::new(&mut buf);
             bld.add_data(TAG_NODE_ID, self.node_id.as_bytes());
             bld.add_data(TAG_PUBLIC_KEY, self.public_key.as_bytes());
+            if let Some(role) = &self.role {
+                bld.add_data(TAG_ROLE, role)
+            }
         }
         buf
     }
@@ -137,10 +141,12 @@ impl AuthHeader {
         let parser = FrameParser::new(data).map_err(|_| MalformedAuthHeader)?;
         let node_id_bytes = parser.get_data(TAG_NODE_ID).map_err(|_| MalformedAuthHeader)?;
         let public_key_bytes = parser.get_data(TAG_PUBLIC_KEY).map_err(|_| MalformedAuthHeader)?;
+        let role = parser.get_optional_data(TAG_ROLE).map(|r| r.to_vec());
         let node_id = NodeId::try_from_bytes(node_id_bytes.to_vec()).map_err(|_| MalformedAuthHeader)?;
         let public_key_arr: [u8; 32] = public_key_bytes.try_into().map_err(|_| MalformedAuthHeader)?;
         Ok(AuthHeader {
             node_id,
+            role,
             public_key: TransportPublicKey(public_key_arr),
         })
     }
@@ -251,7 +257,11 @@ mod tests {
     }
 
     fn auth_header(node_id: u32) -> AuthHeader {
-        AuthHeader::new(node_id, &transport_public_key())
+        AuthHeader::new(node_id, None, &transport_public_key())
+    }
+
+    fn auth_header_with_role(node_id: u32, role: &[u8]) -> AuthHeader {
+        AuthHeader::new(node_id, Some(role), &transport_public_key())
     }
 
     fn signed(node_id: u32) -> (SignatureKeypair, SignedAuthHeader) {
@@ -305,8 +315,26 @@ mod tests {
 
     #[test]
     fn node_id_returns_correct_value() {
-        assert_eq!(auth_header(7u32).node_id(), &NodeId::from(7u32));
+        let header = auth_header(7u32);
+        let details: AuthDetails = header.into();
+        assert_eq!(details.node_id, NodeId::from(7u32));
     }
+
+
+    #[test]
+    fn role_returns_correct_value_when_empty() {
+        let header = auth_header(7u32);
+        let details: AuthDetails = header.into();
+        assert_eq!(details.role, None);
+    }
+
+    #[test]
+    fn role_returns_correct_value_when_set() {
+        let header = auth_header_with_role(7u32, &[9u8]);
+        let details: AuthDetails = header.into();
+        assert_eq!(details.role, Some(vec![9u8]));
+    }
+
 
     // -----------------------------------------------------------------------
     // AuthHeader::sign + SignedAuthHeader::verify — happy path
@@ -316,13 +344,15 @@ mod tests {
     fn sign_and_verify_round_trip() {
         let (kp, signed) = signed(1);
         let recovered = signed.verify(&kp.public).expect("verify failed");
-
-        assert_eq!(recovered.node_id(), &NodeId::from(1u32));
+        
         assert!(
             recovered
                 .validate_public_key(&transport_public_key())
                 .is_ok()
         );
+
+        let details: AuthDetails = recovered.into();
+        assert_eq!(details.node_id, NodeId::from(1u32));
     }
 
     #[test]
@@ -331,18 +361,9 @@ mod tests {
         let raw = signed.expose().to_vec();
 
         let recovered = SignedAuthHeader::verify_raw(&kp.public, &raw).expect("verify_raw failed");
-        assert_eq!(recovered.node_id(), &NodeId::from(2u32));
-    }
 
-    #[test]
-    fn verify_raw_and_verify_are_equivalent() {
-        let (kp, signed) = signed(3);
-        let raw = signed.expose().to_vec();
-
-        let via_method = signed.verify(&kp.public).unwrap();
-        let via_raw = SignedAuthHeader::verify_raw(&kp.public, &raw).unwrap();
-
-        assert_eq!(via_method.node_id(), via_raw.node_id());
+        let details: AuthDetails = recovered.into();
+        assert_eq!(details.node_id, NodeId::from(2u32));
     }
 
     // -----------------------------------------------------------------------
@@ -515,8 +536,8 @@ mod tests {
         let kp = cluster_keypair();
         let key = transport_public_key();
 
-        let header_a = AuthHeader::new(NodeId::from(1u32), &key);
-        let header_b = AuthHeader::new(NodeId::from(2u32), &key);
+        let header_a = AuthHeader::new(NodeId::from(1u32), None, &key);
+        let header_b = AuthHeader::new(NodeId::from(2u32), None, &key);
 
         let signed_a = header_a.sign(&kp.private);
         let signed_b = header_b.sign(&kp.private);
@@ -524,14 +545,17 @@ mod tests {
         // Credentials must differ even with the same transport key.
         assert_ne!(signed_a.expose(), signed_b.expose());
 
+        let auth_a: AuthDetails = signed_a.verify(&kp.public).unwrap().into();
+        let auth_b: AuthDetails = signed_b.verify(&kp.public).unwrap().into();
+
         // Each verifies to the correct node id.
         assert_eq!(
-            signed_a.verify(&kp.public).unwrap().node_id(),
-            &NodeId::from(1u32)
+            auth_a.node_id,
+            NodeId::from(1u32)
         );
         assert_eq!(
-            signed_b.verify(&kp.public).unwrap().node_id(),
-            &NodeId::from(2u32)
+            auth_b.node_id,
+            NodeId::from(2u32)
         );
     }
 
@@ -540,7 +564,7 @@ mod tests {
         let kp = cluster_keypair();
         let key = transport_public_key();
 
-        let signed_a = AuthHeader::new(NodeId::from(1u32), &key)
+        let signed_a = AuthHeader::new(NodeId::from(1u32), None, &key)
             .sign(&kp.private);
         let details: AuthDetails = signed_a.verify(&kp.public).unwrap().into();
 
@@ -558,7 +582,7 @@ mod tests {
         let kp = cluster_keypair();
         let key = transport_public_key();
 
-        let signed_a = AuthHeader::new(NodeId::from(1u32), &key)
+        let signed_a = AuthHeader::new(NodeId::from(1u32),  None, &key)
             .sign(&kp.private);
         let details: AuthDetails = signed_a.verify(&kp.public).unwrap().into();
 
