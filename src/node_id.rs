@@ -1,6 +1,5 @@
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-
-
 
 /// Maximum length of a serialized NodeId. This is not a security boundary —
 /// the Noise handshake caps message size at 65535 bytes regardless — but
@@ -19,7 +18,8 @@ pub struct NodeIdTooLong(usize);
 /// to [`MAX_NODE_ID_LEN`] bytes), or from integer types via the `From<u32>` and
 /// `From<u64>` impls (big-endian encoded). Snowpack treats the bytes as opaque;
 /// callers are responsible for choosing a globally unique identity scheme.
-#[derive(Eq, PartialEq, Hash, Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Eq, PartialEq, Hash, Debug, Clone)]
 pub struct NodeId(Vec<u8>);
 
 

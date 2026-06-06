@@ -1,4 +1,3 @@
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::packet_state::PacketHeader;
@@ -14,7 +13,7 @@ use crate::packets::{PacketRx, PacketTx, ConnectionError};
 /// a [`MessageTx`]. Reads framed messages from the underlying encrypted packet stream.
 /// Each call to [`read_message`][MessageRx::read_message] reads the first packet and
 /// returns a [`Message`] handle; remaining packets are consumed when the message is
-/// decoded or iterated. Only one message can be in progress at a time — the borrow on
+/// read. Only one message can be in progress at a time — the borrow on
 /// [`Message`] prevents another call to `read_message` until it is consumed.
 pub struct MessageRx<R: AsyncRead + Unpin> {
     packets: PacketRx<R>,
@@ -39,31 +38,25 @@ impl<R: AsyncRead + Unpin> MessageRx<R> {
 /// The transmit half of a message transport.
 ///
 /// Obtained from [`accept`][crate::accept] or [`connect`][crate::connect] alongside
-/// a [`MessageRx`]. Serializes and sends messages over the underlying encrypted packet
-/// stream. Structured messages are postcard-encoded via
-/// [`send_message`][MessageTx::send_message]; raw byte streams (e.g. snapshot data)
-/// are forwarded via [`send_reader`][MessageTx::send_reader]. Both paths split the
+/// a [`MessageRx`]. Sends raw byte messages over the underlying encrypted packet
+/// stream via [`send_message`][MessageTx::send_message]; large byte streams are
+/// forwarded via [`send_reader`][MessageTx::send_reader]. Both paths split the
 /// payload into packets of up to 65,519 bytes before encryption.
 pub struct MessageTx<W: AsyncWrite + Unpin> {
     packets: PacketTx<W>,
-    write_buf: Vec<u8>,
 }
 
 impl<W: AsyncWrite + Unpin> MessageTx<W> {
     pub(crate) fn new(packets: PacketTx<W>) -> Self {
-        Self { packets, write_buf: Vec::new() }
+        Self { packets }
     }
 
-    pub async fn send_message<T, M>(&mut self, msg_type: T, message: &M) -> Result<(), ConnectionError>
+    pub async fn send_message<T>(&mut self, msg_type: T, payload: &[u8]) -> Result<(), ConnectionError>
     where
         T: Into<u8>,
-        M: Serialize,
     {
-        self.write_buf.clear();
-        postcard::to_io(message, &mut self.write_buf)
-            .map_err(|e| ConnectionError::MessageSerialization(e.to_string()))?;
         self.packets.prepare_message(msg_type.into())?;
-        self.packets.send_slice(&self.write_buf, true).await
+        self.packets.send_slice(payload, true).await
     }
 
     pub async fn send_reader<T, R>(&mut self, msg_type: T, reader: R) -> Result<(), ConnectionError>
@@ -84,7 +77,7 @@ impl<W: AsyncWrite + Unpin> MessageTx<W> {
 ///
 /// Obtained from [`MessageRx::read_message`]. The first packet is already buffered;
 /// remaining packets are read on demand when the message is consumed via
-/// [`decode`][Message::decode] or [`into_packets`][Message::into_packets].
+/// [`read_bytes`][Message::read_bytes] or [`into_packets`][Message::into_packets].
 /// Borrows the [`MessageRx`] that produced it, preventing concurrent reads until
 /// the message is fully consumed.
 pub struct Message<'r, R: AsyncRead + Unpin> {
@@ -97,22 +90,10 @@ impl<'r, R: AsyncRead + Unpin> Message<'r, R> {
         self.first_header.msg_type
     }
 
-    /// Consume the message, reading all packets and deserializing the payload.
-    pub async fn decode<T: for<'de> Deserialize<'de>>(self) -> Result<T, ConnectionError> {
-        let data = self.read_slice().await?;
-        postcard::from_bytes(data).map_err(|e| ConnectionError::MessageSerialization(e.to_string()))
-    }
-
-    /// Consume the message, returning an iterator over its raw packet payloads.
-    pub fn into_packets(self) -> MessagePackets<'r, R> {
-        MessagePackets {
-            last_sent: false,
-            first_last: Some(self.first_header.last),
-            rx: self.rx,
-        }
-    }
-
-    async fn read_slice(self) -> Result<&'r [u8], ConnectionError> {
+    /// Consume the message, reading all packets into the receive buffer and
+    /// returning a reference to the assembled payload. No allocation — the
+    /// returned slice borrows the buffer owned by the parent [`MessageRx`].
+    pub async fn read_bytes(self) -> Result<&'r [u8], ConnectionError> {
         self.rx.read_buf.clear();
         self.rx.read_buf.extend_from_slice(self.rx.packets.payload());
         let mut last = self.first_header.last;
@@ -122,6 +103,15 @@ impl<'r, R: AsyncRead + Unpin> Message<'r, R> {
             last = header.last;
         }
         Ok(&self.rx.read_buf)
+    }
+
+    /// Consume the message, returning an iterator over its raw packet payloads.
+    pub fn into_packets(self) -> MessagePackets<'r, R> {
+        MessagePackets {
+            last_sent: false,
+            first_last: Some(self.first_header.last),
+            rx: self.rx,
+        }
     }
 }
 
@@ -133,9 +123,7 @@ impl<'r, R: AsyncRead + Unpin> Message<'r, R> {
 ///
 /// Obtained from [`Message::into_packets`]. Each call to [`next`][MessagePackets::next]
 /// returns the payload bytes of the next packet, or `None` after the last packet.
-/// Concatenating all payloads yields the full message payload — postcard-encoded
-/// when the message was sent via [`MessageTx::send_message`], raw bytes when sent
-/// via [`MessageTx::send_reader`].
+/// Concatenating all payloads yields the full message payload.
 pub struct MessagePackets<'r, R: AsyncRead + Unpin> {
     last_sent: bool,
     first_last: Option<bool>,
@@ -179,6 +167,9 @@ mod tests {
         text: String,
     }
 
+    fn encode(msg: &Msg) -> Vec<u8> { serde_json::to_vec(msg).unwrap() }
+    fn decode(bytes: &[u8]) -> Msg { serde_json::from_slice(bytes).unwrap() }
+
     type Tx = MessageTx<WriteHalf<DuplexStream>>;
     type Rx = MessageRx<ReadHalf<DuplexStream>>;
 
@@ -212,19 +203,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // send_message / read_message / decode
+    // send_message / read_message / read_bytes
     // -----------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn send_and_decode_round_trip() {
+    async fn send_and_read_bytes_round_trip() {
         let ((_, mut server_rx), (mut client_tx, _)) = make_pair().await;
         let sent = Msg { id: 1, text: "hello".into() };
 
-        client_tx.send_message(7u8, &sent).await.unwrap();
+        client_tx.send_message(7u8, &encode(&sent)).await.unwrap();
 
         let msg = server_rx.read_message().await.unwrap();
         assert_eq!(msg.msg_type(), 7);
-        assert_eq!(msg.decode::<Msg>().await.unwrap(), sent);
+        assert_eq!(decode(msg.read_bytes().await.unwrap()), sent);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -233,10 +224,10 @@ mod tests {
 
         for i in 0u8..5 {
             let sent = Msg { id: i as u32, text: format!("msg-{i}") };
-            client_tx.send_message(i, &sent).await.unwrap();
+            client_tx.send_message(i, &encode(&sent)).await.unwrap();
             let msg = server_rx.read_message().await.unwrap();
             assert_eq!(msg.msg_type(), i);
-            assert_eq!(msg.decode::<Msg>().await.unwrap(), sent);
+            assert_eq!(decode(msg.read_bytes().await.unwrap()), sent);
         }
     }
 
@@ -244,12 +235,12 @@ mod tests {
     async fn bidirectional() {
         let ((mut server_tx, mut server_rx), (mut client_tx, mut client_rx)) = make_pair().await;
 
-        client_tx.send_message(1u8, &Msg { id: 10, text: "ping".into() }).await.unwrap();
-        let ping: Msg = server_rx.read_message().await.unwrap().decode().await.unwrap();
+        client_tx.send_message(1u8, &encode(&Msg { id: 10, text: "ping".into() })).await.unwrap();
+        let ping = decode(server_rx.read_message().await.unwrap().read_bytes().await.unwrap());
         assert_eq!(ping.id, 10);
 
-        server_tx.send_message(2u8, &Msg { id: 20, text: "pong".into() }).await.unwrap();
-        let pong: Msg = client_rx.read_message().await.unwrap().decode().await.unwrap();
+        server_tx.send_message(2u8, &encode(&Msg { id: 20, text: "pong".into() })).await.unwrap();
+        let pong = decode(client_rx.read_message().await.unwrap().read_bytes().await.unwrap());
         assert_eq!(pong.id, 20);
     }
 
@@ -261,13 +252,15 @@ mod tests {
     async fn large_message_round_trip() {
         let ((_, mut server_rx), (mut client_tx, _)) = make_pair().await;
         let sent = Msg { id: 99, text: "x".repeat(MAX_PACKET_SIZE * 3) };
+        let payload = encode(&sent);
 
         let send_task = tokio::spawn(async move {
-            client_tx.send_message(3u8, &sent).await.unwrap();
+            client_tx.send_message(3u8, &payload).await.unwrap();
             sent
         });
         let recv_task = tokio::spawn(async move {
-            server_rx.read_message().await.unwrap().decode::<Msg>().await.unwrap()
+            let bytes = server_rx.read_message().await.unwrap().read_bytes().await.unwrap();
+            decode(bytes)
         });
 
         let (send_res, recv_res) = tokio::join!(send_task, recv_task);
@@ -279,19 +272,18 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn into_packets_concatenates_to_postcard_encoding() {
+    async fn into_packets_concatenates_to_original_payload() {
         let ((_, mut server_rx), (mut client_tx, _)) = make_pair().await;
-        let msg = Msg { id: 5, text: "chunks".into() };
-        let expected = postcard::to_allocvec(&msg).unwrap();
+        let payload = encode(&Msg { id: 5, text: "chunks".into() });
 
-        client_tx.send_message(4u8, &msg).await.unwrap();
+        client_tx.send_message(4u8, &payload).await.unwrap();
 
         let mut packets = server_rx.read_message().await.unwrap().into_packets();
         let mut full = Vec::new();
         while let Some(chunk) = packets.next().await.unwrap() {
             full.extend_from_slice(chunk);
         }
-        assert_eq!(full, expected);
+        assert_eq!(full, payload);
     }
 
     // -----------------------------------------------------------------------
@@ -299,14 +291,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn send_reader_and_decode() {
+    async fn send_reader_and_read_bytes() {
         let ((_, mut server_rx), (mut client_tx, _)) = make_pair().await;
         let msg = Msg { id: 42, text: "via reader".into() };
-        let encoded = postcard::to_allocvec(&msg).unwrap();
+        let payload = encode(&msg);
 
-        client_tx.send_reader(6u8, std::io::Cursor::new(encoded)).await.unwrap();
+        client_tx.send_reader(6u8, std::io::Cursor::new(payload.clone())).await.unwrap();
 
-        let received: Msg = server_rx.read_message().await.unwrap().decode().await.unwrap();
+        let received = decode(server_rx.read_message().await.unwrap().read_bytes().await.unwrap());
         assert_eq!(received, msg);
     }
 
@@ -319,18 +311,18 @@ mod tests {
         let ((mut server_tx, mut server_rx), (mut client_tx, mut client_rx)) = make_pair().await;
 
         let send = tokio::spawn(async move {
-            client_tx.send_message(5u8, &Msg { id: 1, text: "a".into() }).await.unwrap();
+            client_tx.send_message(5u8, &encode(&Msg { id: 1, text: "a".into() })).await.unwrap();
         });
         let recv = tokio::spawn(async move {
             let msg = server_rx.read_message().await.unwrap();
             assert_eq!(msg.msg_type(), 5);
-            msg.decode::<Msg>().await.unwrap()
+            decode(msg.read_bytes().await.unwrap())
         });
         let (_, recv_res) = tokio::join!(send, recv);
         assert_eq!(recv_res.unwrap().id, 1);
 
-        server_tx.send_message(6u8, &Msg { id: 2, text: "b".into() }).await.unwrap();
-        let pong: Msg = client_rx.read_message().await.unwrap().decode().await.unwrap();
+        server_tx.send_message(6u8, &encode(&Msg { id: 2, text: "b".into() })).await.unwrap();
+        let pong = decode(client_rx.read_message().await.unwrap().read_bytes().await.unwrap());
         assert_eq!(pong.id, 2);
     }
 }

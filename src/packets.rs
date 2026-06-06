@@ -63,9 +63,6 @@ pub enum ConnectionError {
     #[error("invalid node id: {0}")]
     InvalidNodeId(String),
 
-    #[error("message serialization: {0}")]
-    MessageSerialization(String),
-
     #[error(transparent)]
     BadAuth(#[from] BadAuth),
 }
