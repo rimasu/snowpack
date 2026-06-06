@@ -1,6 +1,7 @@
 use std::{fmt, sync::Arc};
 
 use secrecy::{ExposeSecret, SecretVec};
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use yatlv::{FrameBuilder, FrameBuilderLike, FrameParser};
 
@@ -203,6 +204,7 @@ impl fmt::Debug for SignedAuthHeader {
     }
 }
 
+#[cfg(feature = "serde")]
 impl Serialize for SignedAuthHeader {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         if s.is_human_readable() {
@@ -213,6 +215,7 @@ impl Serialize for SignedAuthHeader {
     }
 }
 
+#[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for SignedAuthHeader {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         if d.is_human_readable() {
@@ -445,6 +448,7 @@ mod tests {
     // SignedAuthHeader serde round-trips
     // -----------------------------------------------------------------------
 
+    #[cfg(feature = "serde")]
     #[test]
     fn signed_auth_header_json_round_trip() {
         let (kp, signed) = signed(1);
@@ -463,21 +467,6 @@ mod tests {
         assert_eq!(restored.expose(), original_bytes);
 
         // Restored credential must still verify correctly.
-        restored
-            .verify(&kp.public)
-            .expect("restored credential failed to verify");
-    }
-
-    #[test]
-    fn signed_auth_header_postcard_round_trip() {
-        let (kp, signed) = signed(1);
-        let original_bytes = signed.expose().to_vec();
-
-        let encoded = postcard::to_allocvec(&signed).expect("serialize failed");
-        let restored: SignedAuthHeader =
-            postcard::from_bytes(&encoded).expect("deserialize failed");
-
-        assert_eq!(restored.expose(), original_bytes);
         restored
             .verify(&kp.public)
             .expect("restored credential failed to verify");

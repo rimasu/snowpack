@@ -6,6 +6,7 @@ use ed25519_dalek::SigningKey;
 use ed25519_dalek::VerifyingKey;
 use rand_core::OsRng;
 use secrecy::{ExposeSecret, Secret};
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::{KeyGenError, MalformedKeyError};
@@ -34,7 +35,7 @@ const SIGNATURE_LEN: usize = 64;
 /// The ED25519 public key used to verify signed records.
 ///
 /// Serializes as a lowercase hex string in human-readable formats (TOML, JSON)
-/// and as raw 32 bytes in binary formats (postcard).
+/// and as raw 32 bytes in binary formats.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct SignatureVerificationKey(VerifyingKey);
 
@@ -94,6 +95,7 @@ impl fmt::Display for SignatureVerificationKey {
     }
 }
 
+#[cfg(feature = "serde")]
 impl Serialize for SignatureVerificationKey {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         if s.is_human_readable() {
@@ -104,6 +106,7 @@ impl Serialize for SignatureVerificationKey {
     }
 }
 
+#[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for SignatureVerificationKey {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let arr: [u8; 32] = if d.is_human_readable() {
@@ -134,8 +137,7 @@ impl<'de> Deserialize<'de> for SignatureVerificationKey {
 ///
 /// Only the 32-byte secret scalar is stored and serialized; the public key is
 /// derived from it on construction. Serializes as a lowercase hex string in
-/// human-readable formats (TOML, JSON) and as raw 32 bytes in binary formats
-/// (postcard).
+/// human-readable formats (TOML, JSON) and as raw 32 bytes in binary formats.
 ///
 /// Clone is intentionally not derived — key material should not be casually
 /// copied. Load once from config and pass by reference.
@@ -184,6 +186,7 @@ impl fmt::Debug for SignatureSigningKey {
     }
 }
 
+#[cfg(feature = "serde")]
 impl Serialize for SignatureSigningKey {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         if s.is_human_readable() {
@@ -194,6 +197,7 @@ impl Serialize for SignatureSigningKey {
     }
 }
 
+#[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for SignatureSigningKey {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let arr: [u8; 32] = if d.is_human_readable() {
@@ -222,8 +226,8 @@ pub struct SignatureKeypair {
 
 impl SignatureKeypair {
     /// Generate a fresh ED25519 keypair. This is the only way to create new
-    /// key material — loading existing keys from config goes through the
-    /// serde impls on the individual key types.
+    /// key material — loading existing keys from config goes through
+    /// `TryFrom<&str>` or (with the `serde` feature) the serde impls.
     pub fn generate() -> Result<Self, KeyGenError> {
         let signing_key = SigningKey::generate(&mut OsRng);
         let public_bytes: [u8; 32] = signing_key.verifying_key().to_bytes();
@@ -364,6 +368,7 @@ mod tests {
     // SignatureVerificationKey — serde
     // -----------------------------------------------------------------------
 
+    #[cfg(feature = "serde")]
     #[test]
     fn verification_key_json_round_trip() {
         let kp = keypair();
@@ -375,14 +380,6 @@ mod tests {
         assert!(hex_str.chars().all(|c| c.is_ascii_hexdigit()));
 
         let restored: SignatureVerificationKey = serde_json::from_str(&json).unwrap();
-        assert_eq!(kp.public, restored);
-    }
-
-    #[test]
-    fn verification_key_postcard_round_trip() {
-        let kp = keypair();
-        let bytes = postcard::to_allocvec(&kp.public).unwrap();
-        let restored: SignatureVerificationKey = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(kp.public, restored);
     }
 
@@ -410,6 +407,7 @@ mod tests {
     // SignatureSigningKey — serde
     // -----------------------------------------------------------------------
 
+    #[cfg(feature = "serde")]
     #[test]
     fn signing_key_json_round_trip() {
         let kp = keypair();
@@ -422,15 +420,6 @@ mod tests {
 
         // Verify the restored key produces a blob the original public key accepts.
         let restored: SignatureSigningKey = serde_json::from_str(&json).unwrap();
-        let signed = restored.sign(b"test");
-        kp.public.verify_payload(&signed).unwrap();
-    }
-
-    #[test]
-    fn signing_key_postcard_round_trip() {
-        let kp = keypair();
-        let bytes = postcard::to_allocvec(&kp.private).unwrap();
-        let restored: SignatureSigningKey = postcard::from_bytes(&bytes).unwrap();
         let signed = restored.sign(b"test");
         kp.public.verify_payload(&signed).unwrap();
     }

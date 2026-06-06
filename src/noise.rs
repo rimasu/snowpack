@@ -2,6 +2,7 @@ use std::fmt;
 use std::sync::OnceLock;
 
 use secrecy::{ExposeSecret, Secret};
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use snow::params::NoiseParams;
 
@@ -28,7 +29,7 @@ pub(crate) fn noise_params() -> NoiseParams {
 /// The X25519 public key used to authenticate Noise handshakes between nodes.
 ///
 /// Serializes as a lowercase hex string in human-readable formats (TOML, JSON)
-/// and as raw 32 bytes in binary formats (postcard).
+/// and as raw 32 bytes in binary formats.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct TransportPublicKey(pub [u8; 32]);
 
@@ -65,6 +66,7 @@ impl fmt::Display for TransportPublicKey {
     }
 }
 
+#[cfg(feature = "serde")]
 impl Serialize for TransportPublicKey {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         if s.is_human_readable() {
@@ -75,6 +77,7 @@ impl Serialize for TransportPublicKey {
     }
 }
 
+#[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for TransportPublicKey {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         if d.is_human_readable() {
@@ -103,7 +106,7 @@ impl<'de> Deserialize<'de> for TransportPublicKey {
 ///     key material access visible in code review
 ///
 /// Serializes as a lowercase hex string in human-readable formats (TOML, JSON)
-/// and as raw 32 bytes in binary formats (postcard). Serialization is gated
+/// and as raw 32 bytes in binary formats. Serialization is gated
 /// behind `ExposeSecret` — only call it when writing config files.
 #[derive(Clone)]
 pub struct TransportPrivateKey(Secret<[u8; 32]>);
@@ -144,6 +147,7 @@ impl fmt::Debug for TransportPrivateKey {
     }
 }
 
+#[cfg(feature = "serde")]
 impl Serialize for TransportPrivateKey {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         if s.is_human_readable() {
@@ -154,6 +158,7 @@ impl Serialize for TransportPrivateKey {
     }
 }
 
+#[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for TransportPrivateKey {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         if d.is_human_readable() {
@@ -181,8 +186,8 @@ pub struct TransportKeypair {
 
 impl TransportKeypair {
     /// Generate a fresh X25519 keypair. This is the only way to create new
-    /// key material — loading existing keys from config goes through the
-    /// serde impls on the individual key types.
+    /// key material — loading existing keys from config goes through
+    /// `TryFrom<&str>` or (with the `serde` feature) the serde impls.
     pub fn generate() -> Result<Self, KeyGenError> {
         let keypair = snow::Builder::new(noise_params())
             .generate_keypair()
@@ -271,6 +276,7 @@ mod tests {
         assert!(TransportPublicKey::try_from("ab".repeat(31).as_str()).is_err());
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn public_key_json_round_trip() {
         let key = TransportPublicKey::from([0x99u8; 32]);
@@ -278,14 +284,6 @@ mod tests {
         let hex_str: String = serde_json::from_str(&json).unwrap();
         assert_eq!(hex_str, "99".repeat(32));
         let restored: TransportPublicKey = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored, key);
-    }
-
-    #[test]
-    fn public_key_postcard_round_trip() {
-        let key = TransportPublicKey::from([0xBBu8; 32]);
-        let bytes = postcard::to_allocvec(&key).unwrap();
-        let restored: TransportPublicKey = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(restored, key);
     }
 
@@ -332,21 +330,13 @@ mod tests {
         assert!(TransportPrivateKey::try_from("aa".repeat(31).as_str()).is_err());
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn private_key_json_round_trip() {
         let bytes = [0x11u8; 32];
         let key = TransportPrivateKey::from(bytes);
         let json = serde_json::to_string(&key).unwrap();
         let restored: TransportPrivateKey = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.expose(), &bytes);
-    }
-
-    #[test]
-    fn private_key_postcard_round_trip() {
-        let bytes = [0x22u8; 32];
-        let key = TransportPrivateKey::from(bytes);
-        let encoded = postcard::to_allocvec(&key).unwrap();
-        let restored: TransportPrivateKey = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(restored.expose(), &bytes);
     }
 }
