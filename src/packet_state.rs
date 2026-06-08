@@ -111,6 +111,7 @@ pub enum PacketReadError {
     MissingFirst { msg_type: u8 },
 }
 
+pub(crate) const FRAME_HEADER_SIZE: usize = 2; // u16 big-endian length prefix on every frame
 pub(crate) const MAX_CIPHERTEXT_SIZE: usize = 0xFFFF;
 pub(crate) const CIPHER_OVERHEAD_SIZE: usize = 16;
 pub(crate) const MAX_RAW_PACKET_SIZE: usize = MAX_CIPHERTEXT_SIZE - CIPHER_OVERHEAD_SIZE;

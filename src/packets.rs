@@ -18,6 +18,8 @@ use crate::auth::SignedAuthHeader;
 use crate::noise::TransportPrivateKey;
 use crate::noise::TransportPublicKey;
 use crate::noise::noise_params;
+use crate::packet_state::CIPHER_OVERHEAD_SIZE;
+use crate::packet_state::FRAME_HEADER_SIZE;
 use crate::packet_state::MAX_CIPHERTEXT_SIZE;
 use crate::packet_state::MAX_PACKET_SIZE;
 use crate::packet_state::PacketBuildError;
@@ -84,18 +86,6 @@ where
     Ok(())
 }
 
-async fn write_frame<S>(stream: &mut S, data: &[u8]) -> Result<(), ConnectionError>
-where
-    S: AsyncWrite + Unpin,
-{
-    let len: u16 = data
-        .len()
-        .try_into()
-        .map_err(|_| ConnectionError::PacketOverflow)?;
-    stream.write_u16(len).await?;
-    stream.write_all(data).await?;
-    stream.flush().await.map_err(ConnectionError::from)
-}
 
 // ---------------------------------------------------------------------------
 // HandshakeContext
@@ -124,7 +114,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HandshakeContext<S> {
             handshake,
             stream,
             frame: Vec::new(),
-            noise_buf: vec![0u8; MAX_CIPHERTEXT_SIZE],
+            noise_buf: vec![0u8; FRAME_HEADER_SIZE + MAX_CIPHERTEXT_SIZE],
         })
     }
 
@@ -139,7 +129,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HandshakeContext<S> {
             handshake,
             stream,
             frame: Vec::new(),
-            noise_buf: vec![0u8; MAX_CIPHERTEXT_SIZE],
+            noise_buf: vec![0u8; FRAME_HEADER_SIZE + MAX_CIPHERTEXT_SIZE],
         })
     }
 
@@ -155,8 +145,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HandshakeContext<S> {
 
     /// Encrypt `payload` and write one handshake frame.
     async fn send(&mut self, payload: &[u8]) -> Result<(), ConnectionError> {
-        let n = self.handshake.write_message(payload, &mut self.noise_buf)?;
-        write_frame(&mut self.stream, &self.noise_buf[..n]).await
+        let n = self.handshake.write_message(payload, &mut self.noise_buf[FRAME_HEADER_SIZE..])?;
+        self.noise_buf[..FRAME_HEADER_SIZE].copy_from_slice(&(n as u16).to_be_bytes());
+        self.stream.write_all(&self.noise_buf[..FRAME_HEADER_SIZE + n]).await?;
+        self.stream.flush().await.map_err(ConnectionError::from)
     }
 
     fn remote_static(&self) -> Result<TransportPublicKey, ConnectionError> {
@@ -329,17 +321,22 @@ impl<W: AsyncWrite + Unpin> PacketTx<W> {
     pub(crate) async fn send_packet(&mut self, payload: &[u8], last: bool) -> Result<(), ConnectionError> {
         let plaintext = self.packet_builder.pack(payload, last)?;
 
-        let ciphertext_len = plaintext.len() + 16;
-        if self.write_buf.len() < ciphertext_len {
-            self.write_buf.resize(ciphertext_len, 0);
+        // Reserve FRAME_HEADER_SIZE bytes at the front for the length prefix so the
+        // entire frame (length + ciphertext) can be written in a single syscall.
+        let ciphertext_len = plaintext.len() + CIPHER_OVERHEAD_SIZE;
+        let frame_len = FRAME_HEADER_SIZE + ciphertext_len;
+        if self.write_buf.len() < frame_len {
+            self.write_buf.resize(frame_len, 0);
         }
 
-        let len = {
+        let n = {
             let mut t = self.state.lock().expect("snow cipher state poisoned");
-            t.write_message(plaintext, &mut self.write_buf)?
+            t.write_message(plaintext, &mut self.write_buf[FRAME_HEADER_SIZE..])?
         };
 
-        write_frame(&mut self.write, &self.write_buf[..len]).await
+        self.write_buf[..FRAME_HEADER_SIZE].copy_from_slice(&(n as u16).to_be_bytes());
+        self.write.write_all(&self.write_buf[..FRAME_HEADER_SIZE + n]).await?;
+        self.write.flush().await.map_err(ConnectionError::from)
     }
 
     pub(crate) async fn send_slice(
