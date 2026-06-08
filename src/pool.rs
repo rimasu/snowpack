@@ -49,9 +49,11 @@ impl Connector for TcpConnector {
     fn connect(&self) -> impl Future<Output = Result<tokio::net::TcpStream, ConnectionError>> + Send {
         let addr = (self.hostname.clone(), self.port);
         async move {
-            tokio::net::TcpStream::connect(addr)
+            let stream = tokio::net::TcpStream::connect(addr)
                 .await
-                .map_err(ConnectionError::Io)
+                .map_err(ConnectionError::Io)?;
+            stream.set_nodelay(true).map_err(ConnectionError::Io)?;
+            Ok(stream)
         }
     }
 }
