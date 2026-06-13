@@ -40,8 +40,12 @@
 //!   proves it holds the private key matching the public key it declares,
 //!   and that declaration is signed by a shared cluster key.
 //! - A **framed message transport** layered on top of the encrypted channel.
-//!   Messages are split into packets of up to 65519 bytes, each tagged with
-//!   a 6-bit type discriminant. Up to 64 message types are supported.
+//!   Messages are split into packets of up to [`MAX_PACKET_SIZE`] bytes. Each
+//!   packet carries a 2-byte header encoding a 4-bit [`PacketKind`] and a
+//!   12-bit message-type discriminant (4096 distinct types). The sender may
+//!   abandon an in-progress multi-packet message via
+//!   [`MessageTx::abort_message`]; the receiver sees
+//!   [`ConnectionError::MessageAborted`] and the connection stays live.
 //! - A **[`ConnectionPool`]** that maintains one authenticated,
 //!   auto-reconnecting connection per peer, with a commit/reset [`Guard`]
 //!   that handles mid-RPC cancellation safely.
@@ -139,7 +143,9 @@ pub use auth::{AuthDetails, AuthHeader, BadAuth, MalformedAuthHeader, SignedAuth
 pub use noise::{TransportKeypair, TransportPrivateKey, TransportPublicKey};
 pub use messages::{Message, MessagePackets, MessageRx, MessageTx};
 pub use node_id::{NodeId, NodeIdTooLong, MAX_NODE_ID_LEN};
+pub use packet_state::MAX_PACKET_SIZE;
 pub use packet_state::PacketBuildError;
+pub use packet_state::PacketKind;
 pub use packet_state::PacketReadError;
 pub use packets::ConnectionError;
 pub use pool::{Connection, ConnectionPool, Connector, Credentials, Guard, NotReady, TcpConnector};

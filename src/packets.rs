@@ -67,6 +67,12 @@ pub enum ConnectionError {
 
     #[error(transparent)]
     BadAuth(#[from] BadAuth),
+
+    /// The remote sender abandoned the in-progress message via
+    /// [`MessageTx::abort_message`][crate::MessageTx::abort_message]. The
+    /// connection remains usable; subsequent reads will yield the next message.
+    #[error("message aborted by sender")]
+    MessageAborted,
 }
 
 // ---------------------------------------------------------------------------
@@ -298,8 +304,8 @@ impl<R: AsyncRead + Unpin> PacketRx<R> {
     }
 
     pub(crate) fn payload(&self) -> &[u8] {
-        if self.payload_end > 1 {
-            &self.plaintext_buf[1..self.payload_end]
+        if self.payload_end > 2 {
+            &self.plaintext_buf[2..self.payload_end]
         } else {
             EMPTY_PAYLOAD
         }
@@ -314,7 +320,7 @@ pub(crate) struct PacketTx<W: AsyncWrite + Unpin> {
 }
 
 impl<W: AsyncWrite + Unpin> PacketTx<W> {
-    pub(crate) fn prepare_message<T: Into<u8>>(&mut self, msg_type: T) -> Result<(), ConnectionError> {
+    pub(crate) fn prepare_message<T: Into<u16>>(&mut self, msg_type: T) -> Result<(), ConnectionError> {
         Ok(self.packet_builder.prepare(msg_type.into())?)
     }
 
@@ -392,6 +398,34 @@ impl<W: AsyncWrite + Unpin> PacketTx<W> {
 
         Ok(())
     }
+
+    /// Abandon the current in-progress message by sending an [`Abort`] packet.
+    ///
+    /// The remote [`MessageRx`][crate::messages::MessageRx] will surface this
+    /// as [`ConnectionError::MessageAborted`]. The connection remains usable;
+    /// the next call to [`send_packet`][Self::send_packet] (after a fresh
+    /// [`prepare_message`][Self::prepare_message]) will start a new message.
+    ///
+    /// If no message is currently in progress this is a no-op.
+    ///
+    /// [`Abort`]: crate::packet_state::PacketKind::Abort
+    pub(crate) async fn abort_message(&mut self) -> Result<(), ConnectionError> {
+        if let Some(plaintext) = self.packet_builder.abort() {
+            let ciphertext_len = plaintext.len() + CIPHER_OVERHEAD_SIZE;
+            let frame_len = FRAME_HEADER_SIZE + ciphertext_len;
+            if self.write_buf.len() < frame_len {
+                self.write_buf.resize(frame_len, 0);
+            }
+            let n = {
+                let mut t = self.state.lock().expect("snow cipher state poisoned");
+                t.write_message(plaintext, &mut self.write_buf[FRAME_HEADER_SIZE..])?
+            };
+            self.write_buf[..FRAME_HEADER_SIZE].copy_from_slice(&(n as u16).to_be_bytes());
+            self.write.write_all(&self.write_buf[..FRAME_HEADER_SIZE + n]).await?;
+            self.write.flush().await.map_err(ConnectionError::from)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -402,7 +436,7 @@ mod tests {
         NodeId,
         auth::{AuthHeader, BadAuth, SignedAuthHeader},
         noise::TransportKeypair,
-        packet_state::MAX_PACKET_SIZE,
+        packet_state::{MAX_PACKET_SIZE, PacketKind},
         packets::{EMPTY_PAYLOAD, PacketRx, PacketTx, ConnectionError, accept, connect},
         sign::{SignatureKeypair, SignatureVerificationKey},
     };
@@ -595,9 +629,8 @@ mod tests {
         client_tx.send_slice(b"hello world", true).await.unwrap();
 
         let header = server_rx.read_packet().await.unwrap();
-        assert!(header.first);
-        assert!(header.last);
-        assert_eq!(header.msg_type, 1);
+        assert_eq!(header.kind, PacketKind::Sole);
+        assert_eq!(header.msg_type, 1u16);
         assert_eq!(server_rx.payload(), b"hello world");
     }
 
@@ -613,7 +646,7 @@ mod tests {
         client_tx.send_slice(&[], true).await.unwrap();
 
         let header = server_rx.read_packet().await.unwrap();
-        assert!(header.first && header.last);
+        assert_eq!(header.kind, PacketKind::Sole);
         assert_eq!(server_rx.payload(), EMPTY_PAYLOAD);
     }
 
@@ -642,13 +675,13 @@ mod tests {
             loop {
                 let header = server_rx.read_packet().await.unwrap();
                 if packet_count == 0 {
-                    assert!(header.first, "first packet must have first flag set");
+                    assert_eq!(header.kind, PacketKind::First, "first packet must be First kind");
                 } else {
-                    assert!(!header.first, "only the first packet should have first flag set");
+                    assert_ne!(header.kind, PacketKind::First, "only the first packet should be First kind");
                 }
                 received.extend_from_slice(server_rx.payload());
                 packet_count += 1;
-                if header.last {
+                if header.kind == PacketKind::Last {
                     break;
                 }
             }
@@ -697,7 +730,7 @@ mod tests {
             client_tx.send_slice(&payload, true).await.unwrap();
 
             let header = server_rx.read_packet().await.unwrap();
-            assert_eq!(header.msg_type, i);
+            assert_eq!(header.msg_type, i as u16);
             assert_eq!(server_rx.payload(), payload.as_slice());
         }
     }
